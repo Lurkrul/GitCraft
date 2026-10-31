@@ -12,8 +12,8 @@ Apache-2.0, matching craft-libs.
 | 1 | Workspace scaffold, lints, craft-libs pin, empty window | done |
 | 4a | Settings: remember window size and maximized state (done early, on request) | done |
 | 2 | `gitcraft-git`: locate git, run commands, validate repo, parse log | done |
-| 3 | Worker thread, folder picker, commit list, status bar | next |
-| 4b | Settings: remember and reopen the last repository | |
+| 3 | Worker thread, folder picker, commit list, status bar | done |
+| 4b | Settings: remember and reopen the last repository | next |
 
 ## Done
 
@@ -39,6 +39,17 @@ Apache-2.0, matching craft-libs.
     an empty log, and `truncated` is set when there are more commits than the limit. The parser
     validates hashes (SHA-1 and SHA-256), parents and times; invalid UTF-8 in names is replaced.
   - Try it by hand: `cargo run -p gitcraft-git --example log -- <folder> [limit]`.
+- App, step 3:
+  - `worker.rs`: one background thread owns `Git`. `Job::Open(path)` gives back `Event::Opened` or
+    `Event::Failed` and wakes the UI. A stopped thread is detected (closed channel) and reported.
+  - Folder picker via `craft-dialogs`: answers are handled in `logic`, dialogs shown at the end of `ui`.
+  - Commit table (`egui_extras`): hash (full hash on hover), summary, author (email on hover) and
+    local date. Columns are resizable and only visible rows are laid out.
+  - Status bar: errors in the error colour, a spinner while loading, the commit count, and a
+    truncation notice past 10,000 commits. A failed open keeps the current repository on screen.
+  - Verified on Windows: opened this repo through the real folder picker; opening a non-repository
+    showed the error and kept the history. A 12,000-commit repository loads 10,000 in about 0.3 s
+    (debug build).
 
 ## To verify on Fedora (deferred; batched for later)
 
@@ -46,6 +57,10 @@ Apache-2.0, matching craft-libs.
 - Window size restore. Wayland compositors may ignore the requested size or maximized state.
 
 ## Known issues / notes
+
+- The window and taskbar icon is eframe's default (the egui logo). GitCraft needs its own generic
+  icon (Polish milestone; list it in ATTRIBUTION.md).
+- No way to load history past the first 10,000 commits yet.
 
 - The log follows HEAD only. Milestone 2 (graph, branch filter) will decide on `--all` and
   `--topo-order`.

@@ -36,5 +36,6 @@ they must be updated together with the craft-libs rev.
 - `craft-quit`: window close handling (`on_close_request`, last in `App::logic`).
 - `craft-settings`: `config.toml` storage (`crates/app/src/settings.rs`); saved on a debounce from
   `App::logic` and flushed in `App::on_exit`.
-- `craft-dialogs`: non-blocking folder picker (Milestone 1, step 3).
+- `craft-dialogs`: non-blocking folder picker. Answers are taken in `App::logic`; `show_pending` runs
+  at the end of `App::ui` with the window as parent.
 - `craft-ui`: shared widgets and theme helpers.

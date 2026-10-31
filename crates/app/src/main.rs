@@ -5,6 +5,10 @@
 
 mod app;
 mod settings;
+#[cfg(test)]
+mod test_support;
+mod ui;
+mod worker;
 
 use std::process::ExitCode;
 
@@ -29,7 +33,7 @@ fn main() -> ExitCode {
     // closure take ownership of `settings` and `status` (they are moved into the app, not
     // copied). `Box::new(...)` puts the app on the heap behind a trait object
     // (`Box<dyn eframe::App>`), like a `std::unique_ptr<App>` to a base class in C++.
-    let result = eframe::run_native(app::APP_NAME, options, Box::new(move |_cc| Ok(Box::new(app::GitCraftApp::new(settings, status)))));
+    let result = eframe::run_native(app::APP_NAME, options, Box::new(move |cc| Ok(Box::new(app::GitCraftApp::new(&cc.egui_ctx, settings, status)))));
 
     // A window that can't be created (no GPU driver, no display) is reported, not a panic.
     match result {
