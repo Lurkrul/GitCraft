@@ -20,10 +20,21 @@ pub struct CommitRequest {
     /// Changed files to leave out: whatever is staged for them is unstaged first. Their files on
     /// disk are not touched.
     pub exclude: Vec<String>,
+    /// Files committed in part: only the changes in each patch (from
+    /// [`crate::FileDiff::partial_patch`]). Their files on disk are not touched.
+    pub partial: Vec<PartialFile>,
     /// The full message: summary, then a blank line and the description.
     pub message: String,
     /// Replace the last commit instead of adding a new one.
     pub amend: bool,
+}
+
+/// Part of a file's changes to commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialFile {
+    pub path: String,
+    /// A patch against the file's version in HEAD, holding only the chosen lines.
+    pub patch: Vec<u8>,
 }
 
 /// What the last commit is, for the Amend option.
@@ -50,22 +61,30 @@ impl Git {
         }
         let include = path_list(&request.include)?;
         let exclude = path_list(&request.exclude)?;
+        let partial_paths: Vec<String> = request.partial.iter().map(|file| file.path.clone()).collect();
+        let mut seen = std::collections::HashSet::new();
+        if let Some(twice) = request.include.iter().chain(&request.exclude).chain(&partial_paths).find(|path| !seen.insert(path.as_str())) {
+            return Err(GitError::Malformed { what: "commit request".into(), detail: format!("{twice:?} is listed more than once") });
+        }
+        let partial = path_list(&partial_paths)?;
         let root = repo.root();
         let quick = RunOptions::default();
 
         if let Some(paths) = exclude {
-            if self.has_commits(repo)? {
-                // Puts the index entries back to HEAD's (removing ones HEAD doesn't have).
-                self.run_with_input(root, &["reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"], &quick, paths)?;
-            } else {
-                // No HEAD to reset to: take the files out of the index instead.
-                let args = ["rm", "--cached", "-q", "--ignore-unmatch", "--pathspec-from-file=-", "--pathspec-file-nul"];
-                self.run_with_input(root, &args, &quick, paths)?;
-            }
+            self.unstage(repo, paths)?;
         }
         if let Some(paths) = include {
             // `-A` stages deletions too.
             self.run_with_input(root, &["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], &quick, paths)?;
+        }
+        if let Some(paths) = partial {
+            // The patches are made against HEAD, so the index must hold HEAD's version first.
+            self.unstage(repo, paths)?;
+            // One `git apply` for every file: it applies all of them or none. `--cached` changes
+            // only the index, never the files on disk. `--whitespace=nowarn` stops the user's
+            // `apply.whitespace` setting from rewriting or refusing lines.
+            let patches: Vec<u8> = request.partial.iter().flat_map(|file| file.patch.iter().copied()).collect();
+            self.run_with_input(root, &["apply", "--cached", "--whitespace=nowarn", "-"], &quick, patches)?;
         }
 
         let mut args = vec!["commit", "-q", "-F", "-"];
@@ -103,6 +122,20 @@ impl Git {
             self.run(repo.root(), &["restore", "--source=HEAD", "--staged", "--worktree", "--", path])?;
         } else {
             self.run(repo.root(), &["rm", "--cached", "-q", "--ignore-unmatch", "--", path])?;
+        }
+        Ok(())
+    }
+
+    /// Puts the files' index entries back to HEAD's (`paths` as from [`path_list`]): staged changes
+    /// are dropped, files HEAD doesn't have leave the index. The files on disk are not touched.
+    fn unstage(&self, repo: &Repo, paths: Vec<u8>) -> Result<()> {
+        let quick = RunOptions::default();
+        if self.has_commits(repo)? {
+            self.run_with_input(repo.root(), &["reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"], &quick, paths)?;
+        } else {
+            // No HEAD to reset to: take the files out of the index instead.
+            let args = ["rm", "--cached", "-q", "--ignore-unmatch", "--pathspec-from-file=-", "--pathspec-file-nul"];
+            self.run_with_input(repo.root(), &args, &quick, paths)?;
         }
         Ok(())
     }

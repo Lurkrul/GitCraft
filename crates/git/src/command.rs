@@ -37,9 +37,21 @@ const MAX_STDERR_MESSAGE: usize = 2000;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Options placed before every subcommand so the output doesn't depend on the user's git config:
-/// no pager, no colour codes, paths not escaped, no signature checks mixed into `log`.
-const GLOBAL_ARGS: &[&str] =
-    &["--no-pager", "-c", "color.ui=false", "-c", "core.quotepath=off", "-c", "log.showSignature=false", "-c", "core.pager=cat"];
+/// no pager, no colour codes, paths not escaped, no signature checks mixed into `log`, and blank
+/// context lines in diffs written as a single space (as patches need them).
+const GLOBAL_ARGS: &[&str] = &[
+    "--no-pager",
+    "-c",
+    "color.ui=false",
+    "-c",
+    "core.quotepath=off",
+    "-c",
+    "log.showSignature=false",
+    "-c",
+    "core.pager=cat",
+    "-c",
+    "diff.suppressBlankEmpty=false",
+];
 
 /// What a finished process gave back.
 pub(crate) struct ProcessOutput {

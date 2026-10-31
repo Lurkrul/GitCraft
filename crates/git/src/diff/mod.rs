@@ -1,8 +1,12 @@
 //! One file's changes in a commit, as hunks of numbered lines.
 
 mod parse;
+mod patch;
 
 pub(crate) use parse::parse_patch;
+pub use patch::LineRef;
+
+use std::ops::Range;
 
 use crate::command::RunOptions;
 use crate::error::{GitError, Result};
@@ -58,6 +62,43 @@ pub struct FileDiff {
     pub binary: bool,
     /// More than `MAX_DIFF_LINES` lines; only the first ones are kept.
     pub truncated: bool,
+    /// Git's exact output, for building a patch of chosen lines ([`FileDiff::partial_patch`]).
+    /// `None` when lines can't be picked: a binary file, a cut-short diff, or output that didn't
+    /// add up.
+    pub source: Option<PatchSource>,
+}
+
+impl FileDiff {
+    /// Whether single lines of this diff can be picked for a commit.
+    pub fn can_pick_lines(&self) -> bool {
+        self.source.is_some()
+    }
+}
+
+/// A hunk header's numbers: `@@ -12,5 +12,7 @@` is old lines 12 to 16 and new lines 12 to 18.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HunkRange {
+    pub old_start: u32,
+    pub old_count: u32,
+    pub new_start: u32,
+    pub new_count: u32,
+}
+
+/// The bytes git wrote for one file's diff, with where each part is. Its hunks and lines line up
+/// one for one with [`FileDiff::hunks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchSource {
+    pub(crate) bytes: Vec<u8>,
+    /// The file header (`diff --git`, mode lines, `---`/`+++`) before the first hunk.
+    pub(crate) header: Range<usize>,
+    pub(crate) hunks: Vec<SourceHunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceHunk {
+    pub header: HunkRange,
+    /// Each line's bytes in `PatchSource::bytes`, including its line ending.
+    pub lines: Vec<Range<usize>>,
 }
 
 /// Which file of which commit to diff.

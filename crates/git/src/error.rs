@@ -35,6 +35,8 @@ pub enum GitError {
     OutputTooLarge { command: String, limit: usize },
     /// Git's output did not have the shape we asked for.
     Malformed { what: String, detail: String },
+    /// Something GitCraft can't do (yet, or in this case). The text is the whole message.
+    Unsupported(String),
 }
 
 impl fmt::Display for GitError {
@@ -65,6 +67,7 @@ impl fmt::Display for GitError {
             Self::TimedOut { command, after } => write!(f, "{command} did not finish within {} seconds and was stopped", after.as_secs()),
             Self::OutputTooLarge { command, limit } => write!(f, "{command} produced more than {} MiB of output", limit / (1024 * 1024)),
             Self::Malformed { what, detail } => write!(f, "unexpected output from git ({what}): {detail}"),
+            Self::Unsupported(message) => write!(f, "{message}"),
         }
     }
 }

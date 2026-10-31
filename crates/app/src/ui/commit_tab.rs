@@ -151,7 +151,13 @@ impl Changes {
             return None;
         }
         let paths = |wanted: Tick| self.entries().iter().filter(|entry| self.tick(&entry.path) == wanted).map(|entry| entry.path.clone()).collect();
-        Some(CommitRequest { include: paths(Tick::All), exclude: paths(Tick::Nothing), message: self.message(), amend: self.amend })
+        Some(CommitRequest {
+            include: paths(Tick::All),
+            exclude: paths(Tick::Nothing),
+            partial: Vec::new(),
+            message: self.message(),
+            amend: self.amend,
+        })
     }
 
     /// Starts an amend from the last commit's message, unless the user has already written one.

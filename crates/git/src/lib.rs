@@ -30,9 +30,9 @@ mod repo;
 mod status;
 
 pub use command::RunOptions;
-pub use commit::{AmendInfo, CommitRequest};
+pub use commit::{AmendInfo, CommitRequest, PartialFile};
 pub use details::{ChangedFile, CommitDetails, FileStatus};
-pub use diff::{DiffLine, DiffRequest, FileDiff, Hunk, LineKind, MAX_DIFF_BYTES, MAX_DIFF_LINES};
+pub use diff::{DiffLine, DiffRequest, FileDiff, Hunk, HunkRange, LineKind, LineRef, MAX_DIFF_BYTES, MAX_DIFF_LINES, PatchSource};
 pub use error::{GitError, Result};
 pub use locate::Git;
 pub use log::{Commit, DEFAULT_LOG_LIMIT, Log, LogScope};

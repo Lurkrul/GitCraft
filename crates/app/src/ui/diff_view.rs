@@ -205,6 +205,7 @@ mod tests {
             }],
             binary: false,
             truncated: false,
+            source: None,
         }
     }
 

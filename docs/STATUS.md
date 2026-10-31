@@ -167,7 +167,9 @@ exactly like the command line. Submodules as designed (G7).
 | G1 | Commit tab: changed files (`git status`) and each file's diff from HEAD to the working tree | done |
 | G2 | File checkboxes, summary/description, Commit (Ctrl+Enter), Amend; hook output on failure | done |
 | G2b | Commit tab rows (checkbox, path, letter) and the file right-click menu | done |
-| G3 | Hunk and line checkboxes; pure patch builder for `git apply --cached` | next |
+| G3a | Pure patch builder for chosen lines; committing partial files with `git apply --cached` | done |
+| G3b | Pre-staging: ticks saved in `.git/gitcraft/prestage`, surviving restarts | next |
+| G3c | Line and hunk checkboxes in the Commit tab's diff | |
 | G4 | Discard single hunks and lines (whole files are done in G2b) | |
 | G5 | Branches: new, checkout, rename, delete (with confirmations) | |
 | G6 | Repository menu: fetch, pull, push on a second worker; cancel; `--force-with-lease` only | |
@@ -238,6 +240,30 @@ G2b details (file menu, added on request; takes over the file-level half of G4):
   Discard, ignore and the "Choose a program" flow are covered by tests; opening other programs is
   left for the user to try.
 
+G3 decisions (2026-11-01): ticks are GitCraft's own "pre-staging", kept apart from git's index.
+The index is only changed when Commit is clicked, so a terminal user's `git commit` never picks up
+GitCraft's choices. Pre-staging is saved in the repository (`git rev-parse --git-path
+gitcraft/prestage`, so it works in worktrees and submodules too) and survives restarts. It
+records only the exceptions (unticked files and lines); lines are identified by their position in
+the old file and a hash of their text, so unrelated edits don't reset them. Terminal staging only
+sets the starting ticks of files with no entry yet. A file partly staged in a terminal keeps its
+line boxes disabled until the whole file is ticked.
+
+G3a details:
+- The diff parser keeps git's exact bytes (`FileDiff::source`) next to the readable lines, but only
+  when the diff is complete and each hunk's line counts match its header; otherwise lines can't be
+  picked in that file (binary, over 20,000 lines, or odd output).
+- `FileDiff::partial_patch(selected)`: chosen `+` lines kept, unchosen ones dropped; chosen `-`
+  lines kept, unchosen ones become context; hunk headers recalculated, later hunks shifted, empty
+  hunks dropped. A deleted file that keeps some lines becomes an edit. CRLF and invalid UTF-8 are
+  copied exactly. A choice that splits a "no newline at end of file" pair is refused with a message.
+- `CommitRequest::partial`: those files are reset to HEAD in the index, then one `git apply --cached
+  --whitespace=nowarn` applies every patch (all or none). Files on disk are never touched. A path
+  listed twice in a request is refused.
+- Every git command now sets `diff.suppressBlankEmpty=false`, so blank context lines keep their
+  space whatever the user's config.
+- New `GitError::Unsupported(message)` for things GitCraft can't do in a given case.
+
 ## Feature checklist
 
 `docs/features.md` lists every feature as something to try in the app, for a full pass at the end.
@@ -284,3 +310,6 @@ Ideas agreed for later, not scheduled into a step yet.
 - After a commit the whole repository is read again (like reopening it), so the Repository tab's
   selected commit is cleared. A lighter refresh can come with G5/G6, which also change refs.
 - Committing uses `--pathspec-from-file`, so GitCraft needs git 2.26 or newer (2020).
+- Picking lines of a new (untracked) file stores its bytes as they are on disk: the diff comes from
+  `git diff --no-index`, which skips `core.autocrlf` and clean filters. With `autocrlf=true` such a
+  file could be committed with CRLF where `git add` would store LF. Fix idea: `git add -N` first.

@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use gitcraft_git::{
-    CommitRequest, DiffRequest, EntryKind, FileStatus, Git, GitError, Head, LineKind, LogScope, RefKind, WorkingChange, WorkingDiffRequest,
+    CommitRequest, DiffRequest, EntryKind, FileStatus, Git, GitError, Head, LineKind, LogScope, PartialFile, RefKind, WorkingChange,
+    WorkingDiffRequest,
 };
 
 /// A throwaway repository. Both folders are deleted when this is dropped.
@@ -602,9 +603,155 @@ fn commit_request(include: &[&str], exclude: &[&str], message: &str) -> CommitRe
     CommitRequest {
         include: include.iter().map(|p| p.to_string()).collect(),
         exclude: exclude.iter().map(|p| p.to_string()).collect(),
+        partial: Vec::new(),
         message: message.into(),
         amend: false,
     }
+}
+
+/// Reads `path`'s working diff and builds a patch of the lines `pick` chooses.
+fn pick_lines(git: &Git, opened: &gitcraft_git::Repo, path: &str, new_file: bool, pick: impl Fn(&str) -> bool) -> PartialFile {
+    let diff = git.working_diff(opened, &working(path, new_file)).unwrap();
+    assert!(diff.can_pick_lines(), "{path}: lines should be pickable");
+    let patch = diff.partial_patch(|at| pick(&diff.hunks[at.hunk].lines[at.line].text)).unwrap().expect("something picked");
+    PartialFile { path: path.into(), patch }
+}
+
+/// A file's contents in HEAD.
+fn in_head(repo: &TestRepo, path: &str) -> String {
+    repo.git(&["show", &format!("HEAD:{path}")])
+}
+
+/// Lines "1" to "12", with the given lines' text replaced (by line number).
+fn numbered_with(changes: &[(usize, &str)]) -> String {
+    (1..=12usize)
+        .map(|n| match changes.iter().find(|(line, _)| *line == n) {
+            Some((_, text)) => format!("{text}\n"),
+            None => format!("{n}\n"),
+        })
+        .collect()
+}
+
+fn numbered_lines() -> String {
+    numbered_with(&[])
+}
+
+#[test]
+fn commits_only_the_picked_lines() {
+    let repo = TestRepo::new();
+    write(&repo, "f.txt", &numbered_lines());
+    write(&repo, "other.txt", "o\n");
+    repo.git(&["add", "."]);
+    repo.commit("Root");
+    // Two hunks: line 2 and line 11 changed, plus a new line after 6 in the middle hunk.
+    let edited = numbered_with(&[(2, "two"), (6, "6\nsix and a half"), (11, "eleven")]);
+    write(&repo, "f.txt", &edited);
+    write(&repo, "other.txt", "o2\n");
+
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    // Take "two" (and the removal of "2"), and the new line; leave "11" alone.
+    let file = pick_lines(&git, &opened, "f.txt", false, |text| ["2", "two", "six and a half"].contains(&text));
+    let request = CommitRequest { partial: vec![file], ..commit_request(&["other.txt"], &[], "Part of f") };
+    git.commit(&opened, &request).unwrap();
+
+    let expected = numbered_with(&[(2, "two"), (6, "6\nsix and a half")]);
+    assert_eq!(in_head(&repo, "f.txt") + "\n", expected);
+    assert_eq!(in_head(&repo, "other.txt"), "o2");
+    // The file on disk is untouched, and the rest is still a change, not staged.
+    assert_eq!(std::fs::read_to_string(repo.path().join("f.txt")).unwrap(), edited);
+    let status = git.status(&opened).unwrap();
+    let left: Vec<_> = status.entries.iter().map(|e| (e.path.as_str(), e.has_staged())).collect();
+    assert_eq!(left, [("f.txt", false)]);
+    let rest = git.working_diff(&opened, &working("f.txt", false)).unwrap();
+    assert_eq!(changed_lines(&rest), [(LineKind::Removed, "11".to_string()), (LineKind::Added, "eleven".to_string())]);
+}
+
+#[test]
+fn picked_lines_keep_crlf_endings() {
+    let repo = TestRepo::new();
+    write(&repo, "w.txt", "a\r\nb\r\nc\r\n");
+    repo.git(&["add", "."]);
+    repo.commit("Root");
+    write(&repo, "w.txt", "a\r\nB\r\nc\r\nd\r\n");
+
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    let file = pick_lines(&git, &opened, "w.txt", false, |text| text == "d");
+    git.commit(&opened, &CommitRequest { partial: vec![file], ..commit_request(&[], &[], "Add d") }).unwrap();
+    let blob = Command::new("git").args(["cat-file", "blob", "HEAD:w.txt"]).current_dir(repo.path()).output().unwrap().stdout;
+    assert_eq!(blob, b"a\r\nb\r\nc\r\nd\r\n");
+}
+
+#[test]
+fn part_of_a_new_file_before_the_first_commit() {
+    let repo = TestRepo::new();
+    write(&repo, "new.txt", "keep\nskip\nkeep too\n");
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    let file = pick_lines(&git, &opened, "new.txt", true, |text| text != "skip");
+    git.commit(&opened, &CommitRequest { partial: vec![file], ..commit_request(&[], &[], "First") }).unwrap();
+    assert_eq!(in_head(&repo, "new.txt"), "keep\nkeep too");
+    assert_eq!(std::fs::read_to_string(repo.path().join("new.txt")).unwrap(), "keep\nskip\nkeep too\n");
+}
+
+#[test]
+fn part_of_a_deleted_file_keeps_the_rest() {
+    let repo = TestRepo::new();
+    write(&repo, "d.txt", "one\ntwo\nthree\n");
+    repo.git(&["add", "."]);
+    repo.commit("Root");
+    std::fs::remove_file(repo.path().join("d.txt")).unwrap();
+
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    let file = pick_lines(&git, &opened, "d.txt", false, |text| text == "two");
+    git.commit(&opened, &CommitRequest { partial: vec![file], ..commit_request(&[], &[], "Drop two") }).unwrap();
+    assert_eq!(in_head(&repo, "d.txt"), "one\nthree");
+    assert!(!repo.path().join("d.txt").exists(), "still deleted on disk");
+}
+
+#[test]
+fn picked_lines_apply_after_the_file_changed_again_and_ignore_earlier_staging() {
+    let repo = TestRepo::new();
+    write(&repo, "f.txt", &numbered_lines());
+    repo.git(&["add", "."]);
+    repo.commit("Root");
+    write(&repo, "f.txt", &numbered_with(&[(3, "three")]));
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    let file = pick_lines(&git, &opened, "f.txt", false, |text| text == "3" || text == "three");
+
+    // Meanwhile: something else is staged in a terminal, and the file is edited again.
+    write(&repo, "f.txt", &numbered_with(&[(3, "three"), (12, "twelve")]));
+    repo.git(&["add", "f.txt"]);
+
+    git.commit(&opened, &CommitRequest { partial: vec![file], ..commit_request(&[], &[], "Three") }).unwrap();
+    assert_eq!(in_head(&repo, "f.txt") + "\n", numbered_with(&[(3, "three")]), "only the picked change");
+}
+
+#[test]
+fn blank_lines_survive_a_suppress_blank_empty_config() {
+    let repo = TestRepo::new();
+    repo.git(&["config", "diff.suppressBlankEmpty", "true"]);
+    write(&repo, "b.txt", "a\n\nb\n");
+    repo.git(&["add", "."]);
+    repo.commit("Root");
+    write(&repo, "b.txt", "a\n\nB\nc\n");
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    let file = pick_lines(&git, &opened, "b.txt", false, |text| text == "c");
+    git.commit(&opened, &CommitRequest { partial: vec![file], ..commit_request(&[], &[], "c") }).unwrap();
+    assert_eq!(in_head(&repo, "b.txt"), "a\n\nb\nc");
+}
+
+#[test]
+fn a_path_listed_twice_is_refused() {
+    let repo = TestRepo::new();
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    let request = CommitRequest { partial: vec![PartialFile { path: "a".into(), patch: Vec::new() }], ..commit_request(&["a"], &[], "x") };
+    assert!(matches!(git.commit(&opened, &request), Err(GitError::Malformed { .. })));
 }
 
 /// The files changed by HEAD's commit.
