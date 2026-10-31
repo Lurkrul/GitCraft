@@ -10,8 +10,12 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
-use gitcraft_git::{CommitDetails, DEFAULT_LOG_LIMIT, DiffRequest, FileDiff, Git, GitError, LogScope, Refs, Repo, Status, WorkingDiffRequest};
+use gitcraft_git::{
+    AmendInfo, CommitDetails, CommitRequest, DEFAULT_LOG_LIMIT, DiffRequest, FileDiff, Git, GitError, LogScope, Refs, Repo, Status,
+    WorkingDiffRequest,
+};
 
+use crate::files;
 use crate::graph::History;
 
 /// Called by the worker after each event, to make the UI repaint (and so poll) right away.
@@ -34,6 +38,30 @@ pub enum Job {
     LoadStatus { repo: Repo },
     /// Read one changed file's diff from HEAD to the working tree.
     LoadWorkingDiff { repo: Repo, request: WorkingDiffRequest },
+    /// Commit the chosen changes.
+    Commit { repo: Repo, request: CommitRequest },
+    /// Read the last commit's message and whether it was pushed, for Amend.
+    LoadAmendInfo { repo: Repo },
+    /// Throw away a changed file's changes: the file goes to the Recycle Bin first, then (if git
+    /// tracks it) the committed version is restored.
+    Discard { repo: Repo, path: String, tracked: bool },
+    /// Add a line to the repository's `.gitignore`.
+    Ignore { repo: Repo, line: String },
+    /// Start another program on a file (file manager, default program, "Open with").
+    Launch(Launch),
+}
+
+/// A program to start on a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Launch {
+    Reveal(PathBuf),
+    Open(PathBuf),
+    /// The system's own "Open with" dialog (Windows).
+    SystemOpenWith(PathBuf),
+    OpenWith {
+        program: PathBuf,
+        path: PathBuf,
+    },
 }
 
 /// What the background thread reports back. Each [`Job`] produces exactly one event. Events say
@@ -41,14 +69,62 @@ pub enum Job {
 /// has already moved on.
 #[derive(Debug)]
 pub enum Event {
-    Opened { repo: Repo, refs: Refs, history: History },
-    OpenFailed { path: PathBuf, error: GitError },
-    LogLoaded { repo: Repo, scope: LogScope, history: History },
-    LogFailed { repo: Repo, scope: LogScope, error: GitError },
-    DetailsLoaded { repo: Repo, id: String, result: Result<CommitDetails, GitError> },
-    DiffLoaded { repo: Repo, request: DiffRequest, result: Result<FileDiff, GitError> },
-    StatusLoaded { repo: Repo, result: Result<Status, GitError> },
-    WorkingDiffLoaded { repo: Repo, request: WorkingDiffRequest, result: Result<FileDiff, GitError> },
+    Opened {
+        repo: Repo,
+        refs: Refs,
+        history: History,
+    },
+    OpenFailed {
+        path: PathBuf,
+        error: GitError,
+    },
+    LogLoaded {
+        repo: Repo,
+        scope: LogScope,
+        history: History,
+    },
+    LogFailed {
+        repo: Repo,
+        scope: LogScope,
+        error: GitError,
+    },
+    DetailsLoaded {
+        repo: Repo,
+        id: String,
+        result: Result<CommitDetails, GitError>,
+    },
+    DiffLoaded {
+        repo: Repo,
+        request: DiffRequest,
+        result: Result<FileDiff, GitError>,
+    },
+    StatusLoaded {
+        repo: Repo,
+        result: Result<Status, GitError>,
+    },
+    WorkingDiffLoaded {
+        repo: Repo,
+        request: WorkingDiffRequest,
+        result: Result<FileDiff, GitError>,
+    },
+    /// The new commit's id, or why git refused.
+    Committed {
+        repo: Repo,
+        result: Result<String, GitError>,
+    },
+    AmendInfoLoaded {
+        repo: Repo,
+        result: Result<AmendInfo, GitError>,
+    },
+    /// A discard or ignore finished; the message says what went wrong, if anything.
+    FilesChanged {
+        repo: Repo,
+        result: Result<(), String>,
+    },
+    /// A program was started, or couldn't be.
+    Launched {
+        result: Result<(), String>,
+    },
 }
 
 /// The UI's handle on the background thread. Dropping it closes the job channel, which ends the
@@ -148,12 +224,57 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, wake: Wake) {
                 let result = located(&mut git).and_then(|git| git.working_diff(&repo, &request));
                 Event::WorkingDiffLoaded { repo, request, result }
             }
+            Job::Commit { repo, request } => {
+                let result = located(&mut git).and_then(|git| git.commit(&repo, &request));
+                Event::Committed { repo, result }
+            }
+            Job::LoadAmendInfo { repo } => {
+                let result = located(&mut git).and_then(|git| git.amend_info(&repo));
+                Event::AmendInfoLoaded { repo, result }
+            }
+            Job::Discard { repo, path, tracked } => {
+                let result = discard(&mut git, &repo, &path, tracked);
+                Event::FilesChanged { repo, result }
+            }
+            Job::Ignore { repo, line } => {
+                let result = files::add_to_gitignore(repo.root(), &line).map(|_| ()).map_err(|error| format!("Could not update .gitignore: {error}"));
+                Event::FilesChanged { repo, result }
+            }
+            Job::Launch(launch) => Event::Launched { result: start(&launch) },
         };
         if events.send(event).is_err() {
             break; // The UI has gone away.
         }
         wake();
     }
+}
+
+/// Discards one file's changes. The file on disk goes to the Recycle Bin first; if that fails,
+/// nothing is changed. Only then does git put back the committed version (for a tracked file).
+fn discard(git: &mut Option<Git>, repo: &Repo, path: &str, tracked: bool) -> Result<(), String> {
+    let git = located(git).map_err(|error| error.to_string())?;
+    let full = files::full_path(repo.root(), path);
+    // `symlink_metadata` doesn't follow a symlink, so a link is recycled itself, not its target.
+    if full.symlink_metadata().is_ok() {
+        files::move_to_trash(&full)
+            .map_err(|error| format!("Could not move {path} to the {}, so nothing was changed: {error}", files::TRASH_NAME))?;
+    }
+    if tracked {
+        git.discard(repo, path)
+            .map_err(|error| format!("{path} was moved to the {}, but putting back the committed version failed: {error}", files::TRASH_NAME))?;
+    }
+    Ok(())
+}
+
+/// Starts a program on a file, without waiting for it.
+fn start(launch: &Launch) -> Result<(), String> {
+    let (result, what) = match launch {
+        Launch::Reveal(path) => (files::reveal(path), format!("show it in {}", files::FILE_MANAGER_NAME)),
+        Launch::Open(path) => (files::open(path), "open it".to_string()),
+        Launch::SystemOpenWith(path) => (files::open_with_system_dialog(path), "show the \"Open with\" dialog".to_string()),
+        Launch::OpenWith { program, path } => (files::open_with(program, path), format!("open it with {}", program.display())),
+    };
+    result.map_err(|error| format!("Could not {what}: {error}"))
 }
 
 fn open(git: &mut Option<Git>, path: &std::path::Path) -> Result<(Repo, Refs, History), GitError> {

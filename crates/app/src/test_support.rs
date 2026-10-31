@@ -16,6 +16,17 @@ impl TestRepo {
         let repo = TestRepo { dir: tempfile::tempdir().unwrap(), config_dir: tempfile::tempdir().unwrap() };
         std::fs::write(repo.config_dir.path().join("gitconfig"), b"").unwrap();
         repo.git(&["init", "-q", "-b", "main"]);
+        // Commits GitCraft makes use the machine's own git config; these repository settings
+        // override anything there that would change the results (identity, signing, hooks).
+        for (key, value) in [
+            ("user.name", "Test Author"),
+            ("user.email", "test@example.com"),
+            ("commit.gpgsign", "false"),
+            ("core.hooksPath", ".git/hooks"),
+            ("core.autocrlf", "false"),
+        ] {
+            repo.git(&["config", key, value]);
+        }
         for message in messages {
             repo.git(&["commit", "-q", "--allow-empty", "-m", message]);
         }
@@ -36,7 +47,7 @@ impl TestRepo {
     }
 
     /// Runs git with the user's own config shut out (it could require signed commits).
-    pub fn git(&self, args: &[&str]) {
+    pub fn git(&self, args: &[&str]) -> String {
         let output = Command::new("git")
             .args(["-c", "user.name=Test Author", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false"])
             .args(args)
@@ -46,6 +57,7 @@ impl TestRepo {
             .output()
             .unwrap();
         assert!(output.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 }
 

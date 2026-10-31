@@ -7,7 +7,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use gitcraft_git::{DiffRequest, EntryKind, FileStatus, Git, GitError, Head, LineKind, LogScope, RefKind, WorkingChange, WorkingDiffRequest};
+use gitcraft_git::{
+    CommitRequest, DiffRequest, EntryKind, FileStatus, Git, GitError, Head, LineKind, LogScope, RefKind, WorkingChange, WorkingDiffRequest,
+};
 
 /// A throwaway repository. Both folders are deleted when this is dropped.
 struct TestRepo {
@@ -22,6 +24,17 @@ impl TestRepo {
         let repo = TestRepo { dir: tempfile::tempdir().unwrap(), config_dir: tempfile::tempdir().unwrap() };
         std::fs::write(repo.empty_config(), b"").unwrap();
         repo.git(&["init", "-q", "-b", "main"]);
+        // Commits made through `Git` use the machine's own config; these repository settings
+        // override anything there that would change the results (identity, signing, hooks).
+        for (key, value) in [
+            ("user.name", "Test Author"),
+            ("user.email", "test@example.com"),
+            ("commit.gpgsign", "false"),
+            ("core.hooksPath", ".git/hooks"),
+            ("core.autocrlf", "false"),
+        ] {
+            repo.git(&["config", key, value]);
+        }
         repo
     }
 
@@ -583,4 +596,180 @@ fn working_diff_paths_are_literal_and_stay_inside() {
 
     let escape = git.working_diff(&opened, &working("../outside.txt", true));
     assert!(matches!(escape, Err(GitError::Malformed { .. })), "{escape:?}");
+}
+
+fn commit_request(include: &[&str], exclude: &[&str], message: &str) -> CommitRequest {
+    CommitRequest {
+        include: include.iter().map(|p| p.to_string()).collect(),
+        exclude: exclude.iter().map(|p| p.to_string()).collect(),
+        message: message.into(),
+        amend: false,
+    }
+}
+
+/// The files changed by HEAD's commit.
+fn files_in_head(repo: &TestRepo) -> Vec<String> {
+    let mut files: Vec<String> = repo.git(&["show", "--name-only", "--format=", "HEAD"]).lines().map(str::to_string).collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn commits_only_the_included_files() {
+    let repo = TestRepo::new();
+    write(&repo, "keep.txt", "1\n");
+    write(&repo, "gone.txt", "1\n");
+    write(&repo, "staged elsewhere.txt", "1\n");
+    repo.git(&["add", "."]);
+    repo.commit("Root");
+
+    write(&repo, "keep.txt", "2\n");
+    std::fs::remove_file(repo.path().join("gone.txt")).unwrap();
+    write(&repo, "new [1].txt", "new\n");
+    write(&repo, "staged elsewhere.txt", "2\n");
+    repo.git(&["add", "staged elsewhere.txt"]); // staged in a terminal, then unticked in GitCraft
+    write(&repo, "not ticked.txt", "x\n");
+
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    let request = commit_request(&["keep.txt", "gone.txt", "new [1].txt"], &["staged elsewhere.txt", "not ticked.txt"], "Pick some\n\nDetails here.");
+    let id = git.commit(&opened, &request).unwrap();
+
+    assert_eq!(id, repo.git(&["rev-parse", "HEAD"]));
+    assert_eq!(files_in_head(&repo), ["gone.txt", "keep.txt", "new [1].txt"]);
+    assert_eq!(repo.git(&["log", "-1", "--format=%B"]), "Pick some\n\nDetails here.");
+    // The left-out changes are still on disk, and no longer staged.
+    let status = git.status(&opened).unwrap();
+    let left: Vec<_> = status.entries.iter().map(|e| (e.path.as_str(), e.has_staged())).collect();
+    assert_eq!(left, [("staged elsewhere.txt", false), ("not ticked.txt", false)]);
+    assert_eq!(std::fs::read_to_string(repo.path().join("staged elsewhere.txt")).unwrap(), "2\n");
+}
+
+#[test]
+fn the_first_commit_can_leave_files_out() {
+    let repo = TestRepo::new();
+    write(&repo, "a.txt", "a\n");
+    write(&repo, "b.txt", "b\n");
+    repo.git(&["add", "."]);
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    git.commit(&opened, &commit_request(&["a.txt"], &["b.txt"], "First")).unwrap();
+    assert_eq!(files_in_head(&repo), ["a.txt"]);
+    let status = git.status(&opened).unwrap();
+    assert_eq!(status.entries.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), ["b.txt"]);
+    assert!(!status.unborn);
+}
+
+#[test]
+fn amend_replaces_the_last_commit() {
+    let repo = TestRepo::new();
+    write(&repo, "a.txt", "a\n");
+    repo.git(&["add", "."]);
+    let first = repo.commit("Root");
+    write(&repo, "b.txt", "b\n");
+    repo.git(&["add", "."]);
+    repo.commit("Second, with a typo");
+
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    let info = git.amend_info(&opened).unwrap();
+    assert_eq!(info.message, "Second, with a typo");
+    assert_eq!(info.pushed_to, None);
+
+    write(&repo, "c.txt", "c\n");
+    let request = CommitRequest { amend: true, ..commit_request(&["c.txt"], &[], "Second") };
+    git.commit(&opened, &request).unwrap();
+    assert_eq!(repo.git(&["rev-parse", "HEAD~1"]), first, "replaced, not added");
+    assert_eq!(files_in_head(&repo), ["b.txt", "c.txt"]);
+    assert_eq!(repo.git(&["log", "-1", "--format=%s"]), "Second");
+}
+
+#[test]
+fn amend_info_knows_a_pushed_commit() {
+    let origin = TestRepo::new();
+    origin.commit("Root");
+    let clone_dir = tempfile::tempdir().unwrap();
+    let clone_path = clone_dir.path().join("clone");
+    origin.git(&["clone", "-q", origin.path().to_str().unwrap(), clone_path.to_str().unwrap()]);
+    let git = git();
+    let opened = git.open_repo(&clone_path).unwrap();
+    assert_eq!(git.amend_info(&opened).unwrap().pushed_to.as_deref(), Some("refs/remotes/origin/main"));
+}
+
+#[test]
+fn a_failing_hook_stops_the_commit_and_says_why() {
+    let repo = TestRepo::new();
+    repo.commit("Root");
+    let hook = repo.path().join(".git").join("hooks").join("pre-commit");
+    std::fs::write(&hook, "#!/bin/sh\necho 'lint failed: tabs in a.txt' >&2\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    write(&repo, "a.txt", "a\n");
+
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    let before = repo.git(&["rev-parse", "HEAD"]);
+    match git.commit(&opened, &commit_request(&["a.txt"], &[], "Blocked")) {
+        Err(GitError::CommandFailed { command, stderr, .. }) => {
+            assert_eq!(command, "git commit");
+            assert!(stderr.contains("lint failed"), "{stderr}");
+        }
+        other => panic!("expected the hook to stop it, got {other:?}"),
+    }
+    assert_eq!(repo.git(&["rev-parse", "HEAD"]), before);
+}
+
+#[test]
+fn an_empty_message_is_refused_before_running_git() {
+    let repo = TestRepo::new();
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    assert!(matches!(git.commit(&opened, &commit_request(&[], &[], "  \n ")), Err(GitError::Malformed { .. })));
+}
+
+#[test]
+fn discard_puts_files_back_as_committed() {
+    let repo = TestRepo::new();
+    write(&repo, "edited.txt", "original\n");
+    write(&repo, "deleted.txt", "keep me\n");
+    write(&repo, "staged edit.txt", "original\n");
+    repo.git(&["add", "."]);
+    repo.commit("Root");
+
+    write(&repo, "edited.txt", "changed\n");
+    std::fs::remove_file(repo.path().join("deleted.txt")).unwrap();
+    write(&repo, "staged edit.txt", "changed\n");
+    repo.git(&["add", "staged edit.txt"]);
+    write(&repo, "new staged.txt", "new\n");
+    repo.git(&["add", "new staged.txt"]);
+    write(&repo, "other.txt", "untouched\n");
+
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    for path in ["edited.txt", "deleted.txt", "staged edit.txt", "new staged.txt"] {
+        git.discard(&opened, path).unwrap();
+    }
+    let read = |name: &str| std::fs::read_to_string(repo.path().join(name)).ok();
+    assert_eq!(read("edited.txt").as_deref(), Some("original\n"));
+    assert_eq!(read("deleted.txt").as_deref(), Some("keep me\n"));
+    assert_eq!(read("staged edit.txt").as_deref(), Some("original\n"));
+    assert_eq!(read("new staged.txt"), None, "a newly added file is removed");
+    let status = git.status(&opened).unwrap();
+    assert_eq!(status.entries.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), ["other.txt"], "only the untouched file is left");
+}
+
+#[test]
+fn discard_before_the_first_commit_unstages() {
+    let repo = TestRepo::new();
+    write(&repo, "first.txt", "a\n");
+    repo.git(&["add", "first.txt"]);
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    git.discard(&opened, "first.txt").unwrap();
+    let status = git.status(&opened).unwrap();
+    assert_eq!(status.entries[0].kind, EntryKind::Untracked);
+    assert!(git.discard(&opened, "../outside").is_err());
 }

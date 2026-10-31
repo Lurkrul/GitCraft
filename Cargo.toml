@@ -22,11 +22,13 @@ craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "c39e435cc34
 gitcraft-git = { path = "crates/git" }
 
 egui = { version = "0.37", default-features = false }
-eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "wayland", "x11"] }
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "wgpu", "wayland", "x11"] }
 egui_extras = { version = "0.37", default-features = false }
 # Same version and base features as craft-libs; `clock` adds the local time zone for commit dates.
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
 serde = { version = "1", features = ["derive"] }
+# Moves files to the Recycle Bin (Windows) or Trash (Linux) before a discard, so it can be undone.
+trash = "5"
 tempfile = "3"
 
 [workspace.lints.rust]

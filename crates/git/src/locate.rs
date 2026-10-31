@@ -31,7 +31,7 @@ impl Git {
         platform::hide_console(&mut command);
 
         let unusable = |reason: String| GitError::Unusable { exe: exe.clone(), reason };
-        let output = run_process(command, &RunOptions::default(), "git --version").map_err(|err| unusable(err.to_string()))?;
+        let output = run_process(command, &RunOptions::default(), "git --version", None).map_err(|err| unusable(err.to_string()))?;
         if !output.status.success() {
             return Err(unusable(format!("`--version` failed: {}", String::from_utf8_lossy(&output.stderr).trim())));
         }

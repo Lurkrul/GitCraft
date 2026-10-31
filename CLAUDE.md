@@ -127,5 +127,6 @@ Work through these in order; each one ends in something the user can run and tes
 |---|---|
 | `CLAUDE.md` | This file: rules and working instructions |
 | `docs/STATUS.md` | Current state, next steps, known issues — start every session here |
+| `docs/features.md` | Every feature as a check to try in the app; each step adds its items, for a full pass at the end |
 | `docs/architecture.md` | Layers, data flow, background-work model |
 | `ATTRIBUTION.md` | Every asset with source, author and licence |

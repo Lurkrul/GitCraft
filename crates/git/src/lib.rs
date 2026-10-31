@@ -17,6 +17,7 @@
 //! ```
 
 mod command;
+mod commit;
 mod details;
 mod diff;
 mod error;
@@ -29,6 +30,7 @@ mod repo;
 mod status;
 
 pub use command::RunOptions;
+pub use commit::{AmendInfo, CommitRequest};
 pub use details::{ChangedFile, CommitDetails, FileStatus};
 pub use diff::{DiffLine, DiffRequest, FileDiff, Hunk, LineKind, MAX_DIFF_BYTES, MAX_DIFF_LINES};
 pub use error::{GitError, Result};

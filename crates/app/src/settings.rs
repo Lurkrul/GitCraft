@@ -25,6 +25,7 @@ pub struct Prefs {
     pub window: WindowPrefs,
     pub layout: LayoutPrefs,
     pub repositories: RepositoryPrefs,
+    pub open_with: OpenWithPrefs,
 }
 
 /// The main window's size, in egui points (logical pixels, independent of display scaling).
@@ -158,6 +159,34 @@ impl RepositoryPrefs {
     }
 }
 
+/// Most programs remembered for "Open with".
+pub const MAX_RECENT_PROGRAMS: usize = 8;
+
+/// Programs picked for "Open with", most recent first.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct OpenWithPrefs {
+    /// Full paths. Text, like the repository paths, so a non-Unicode path isn't remembered.
+    pub programs: Vec<String>,
+}
+
+impl OpenWithPrefs {
+    /// Records a program the user picked: it moves to the front, and the list is trimmed.
+    pub fn remember(&mut self, program: &Path) {
+        let Some(text) = program.to_str() else {
+            return;
+        };
+        self.programs.retain(|known| Path::new(known) != program);
+        self.programs.insert(0, text.to_string());
+        self.programs.truncate(MAX_RECENT_PROGRAMS);
+    }
+
+    /// The remembered programs (empty entries from a hand-edited file are skipped).
+    pub fn programs(&self) -> Vec<PathBuf> {
+        self.programs.iter().filter(|program| !program.trim().is_empty()).map(PathBuf::from).collect()
+    }
+}
+
 // A trait implementation: craft-settings is generic over any type that implements `Settings`,
 // like a C++ template constrained by a concept. The constants pick the folder and file version.
 impl Settings for Prefs {
@@ -218,6 +247,21 @@ mod tests {
         }
         let (store, _) = SettingsStore::<Prefs>::open_at(dir.path());
         assert_eq!(store.get().window, WindowPrefs { width: 1234.0, height: 567.0, maximized: true });
+    }
+
+    #[test]
+    fn open_with_programs_are_remembered_newest_first() {
+        let mut prefs = OpenWithPrefs::default();
+        for n in 0..MAX_RECENT_PROGRAMS + 2 {
+            prefs.remember(&root(&format!("app{n}")));
+        }
+        prefs.remember(&root("app3"));
+        let programs = prefs.programs();
+        assert_eq!(programs.len(), MAX_RECENT_PROGRAMS);
+        assert_eq!(programs[0], root("app3"), "picked again: moved to the front, not duplicated");
+        assert_eq!(programs.iter().filter(|p| **p == root("app3")).count(), 1);
+        let hand_edited = OpenWithPrefs { programs: vec!["".into(), "  ".into()] };
+        assert!(hand_edited.programs().is_empty());
     }
 
     fn root(name: &str) -> PathBuf {

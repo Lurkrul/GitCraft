@@ -165,9 +165,10 @@ exactly like the command line. Submodules as designed (G7).
 | Step | What | State |
 |---|---|---|
 | G1 | Commit tab: changed files (`git status`) and each file's diff from HEAD to the working tree | done |
-| G2 | File checkboxes, summary/description, Commit (Ctrl+Enter), Amend; hook output on failure | next |
-| G3 | Hunk and line checkboxes; pure patch builder for `git apply --cached` | |
-| G4 | Discard changes (file, hunk, lines) after a confirmation naming what is lost | |
+| G2 | File checkboxes, summary/description, Commit (Ctrl+Enter), Amend; hook output on failure | done |
+| G2b | Commit tab rows (checkbox, path, letter) and the file right-click menu | done |
+| G3 | Hunk and line checkboxes; pure patch builder for `git apply --cached` | next |
+| G4 | Discard single hunks and lines (whole files are done in G2b) | |
 | G5 | Branches: new, checkout, rename, delete (with confirmations) | |
 | G6 | Repository menu: fetch, pull, push on a second worker; cancel; `--force-with-lease` only | |
 | G7 | Submodules: Repository → Submodules menu, list, open with breadcrumb, Commit tab entries | |
@@ -191,6 +192,57 @@ G1 details:
 - Verified on Windows with the demo repository: a modified file (two hunks), a deleted file (all
   red) and an untracked file (all green).
 
+G2 details:
+- Git layer: `commit(repo, CommitRequest { include, exclude, message, amend })` unstages the left-out
+  files (`reset`, or `rm --cached` before the first commit), stages the included ones (`add -A`),
+  then runs `git commit -F -`. Paths and the message go through stdin (`--pathspec-from-file=-
+  --pathspec-file-nul`, new `Git::run_with_input`), so there is no command-line length limit and
+  nothing is read as an option. Hooks run as usual, with a 10-minute limit. `amend_info` reads the
+  last message and whether a remote branch already contains HEAD. `status` now also reports the
+  branch and whether it has no commits yet (`--branch`).
+- Commit tab: a checkbox per file plus an all/none box (part-filled when mixed). Everything starts
+  ticked; if anything is already staged when files first appear, the ticks follow the index, and a
+  file staged only in part shows a part-filled box and commits exactly its staged part. Ticks
+  survive refreshes.
+- Message box anchored at the bottom of the left pane: Summary (required), Description, Amend last
+  commit, and "Commit to <branch>" (Ctrl+Enter from either box). The button explains on hover why
+  it is disabled. Amend fills in the last message (unless one is typed) and asks for confirmation
+  ("Amend anyway") if the commit is already on a remote. A refused commit (failing hook) shows git's
+  output under the button and keeps the message; a successful one clears the box and reloads the
+  repository.
+- `ui/confirm.rs`: a reusable confirmation dialog (Esc or a click outside cancels).
+- Fixed: copy and paste didn't work anywhere in GitCraft (eframe's `clipboard` feature was off).
+- Verified on Windows: unticked one of two files, pasted a summary, committed; only the ticked file
+  was committed and the other stayed, ticked again.
+
+G2b details (file menu, added on request; takes over the file-level half of G4):
+- Commit tab rows now read: checkbox, path from the repository root, change letter on the right.
+- Right-click a changed file: Discard changes…, Ignore file, Ignore all .ext files, Copy path, Copy
+  relative path, Show in Explorer (file manager on Linux), Open, Open with ▸ (remembered programs,
+  Choose a program…, and on Windows the system "Open with" dialog).
+- Discard asks first, saying exactly what will be lost. The current file is moved to the Recycle
+  Bin / Trash (`trash` crate) before git restores the committed version (`git restore
+  --source=HEAD --staged --worktree`); if recycling fails, nothing is changed. New files are only
+  recycled; before the first commit a staged file is unstaged.
+- Ignore adds an anchored, escaped line (`/path`, or `*.ext`) to the root `.gitignore`, creating it
+  if needed, keeping its line endings, never duplicating a line, and replacing the file in one step.
+  Only offered for untracked files.
+- Opening uses full system paths (`%SystemRoot%\explorer.exe`, `rundll32 shell32.dll,OpenAs_RunDLL`;
+  `xdg-open` on Linux) and never a shell, so file names can't be read as commands. Programs picked
+  with "Choose a program…" are remembered (up to 8) in `[open_with]`.
+- Platform code lives in `crates/app/src/files/{windows,unix}.rs`. craft-libs has no helpers for
+  revealing/opening files or the Recycle Bin; worth adding there later.
+- File rows keep a scroll-bar-wide gap at their right end, so a floating scroll bar no longer covers
+  the change letter (or the +/- counts in the details panel).
+- Verified on Windows: the menu on a tracked file (Ignore greyed out) and the Open with submenu.
+  Discard, ignore and the "Choose a program" flow are covered by tests; opening other programs is
+  left for the user to try.
+
+## Feature checklist
+
+`docs/features.md` lists every feature as something to try in the app, for a full pass at the end.
+Each step adds its items. Ones the user skipped are marked "(not checked yet)".
+
 ## Backlog
 
 Ideas agreed for later, not scheduled into a step yet.
@@ -210,6 +262,7 @@ Ideas agreed for later, not scheduled into a step yet.
 - Window size restore. Wayland compositors may ignore the requested size or maximized state.
 - Reopening the last repository, branch and dividers after a restart (`~/.config/gitcraft/config.toml`).
 - Commit tab: status and diffs on Linux (`/dev/null` with `--no-index`, file names with `:` or a backslash), and the focus refresh under Wayland.
+- Commit tab menu on Linux: Trash, `xdg-open` for Show in file manager and Open, Choose a program.
 
 ## Known issues / notes
 
@@ -228,3 +281,6 @@ Ideas agreed for later, not scheduled into a step yet.
   Windows if wanted.
 - Set `GITCRAFT_CONFIG_DIR` to use a different settings folder (empty means don't save at all), handy for testing.
 - Fonts: egui's default fonts for now; craft-fonts is not wired in yet.
+- After a commit the whole repository is read again (like reopening it), so the Repository tab's
+  selected commit is cleared. A lighter refresh can come with G5/G6, which also change refs.
+- Committing uses `--pathspec-from-file`, so GitCraft needs git 2.26 or newer (2020).

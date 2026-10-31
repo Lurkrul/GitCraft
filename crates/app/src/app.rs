@@ -7,12 +7,14 @@ use std::time::Instant;
 use craft_dialogs::{Answer, Dialogs, FileDialog};
 use craft_menu::MenuBar;
 use craft_settings::{SaveStatus, SettingsStore};
-use gitcraft_git::{DEFAULT_LOG_LIMIT, DiffRequest, Head, LogScope, Refs, Repo, WorkingDiffRequest};
+use gitcraft_git::{DEFAULT_LOG_LIMIT, DiffRequest, LogScope, Refs, Repo, WorkingDiffRequest};
 
 use crate::commands::Command;
+use crate::files;
 use crate::graph::History;
 use crate::settings::{LayoutPrefs, Prefs};
 use crate::ui::commit_tab::{self, Changes};
+use crate::ui::confirm::{self, Choice, Confirm};
 use crate::ui::details::DetailsState;
 use crate::ui::diff_view::{self, DiffState, DiffView};
 use crate::ui::ref_labels::{self, LabelMap};
@@ -20,24 +22,26 @@ use crate::ui::repository::RepoLayout;
 use crate::ui::status_bar::StatusLine;
 use crate::ui::tabs::MainTab;
 use crate::ui::{about, menu, placeholder, repository, status_bar, tabs};
-use crate::worker::{Event, Job, Worker};
+use crate::worker::{Event, Job, Launch, Worker};
 
 /// The product name, used for the window title and messages.
 pub const APP_NAME: &str = "GitCraft";
 
 const WORKER_STOPPED: &str = "GitCraft's background worker stopped unexpectedly. Please restart GitCraft.";
 
-/// What a file dialog's answer is for. Only one purpose so far; more will follow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a file dialog's answer is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DialogPurpose {
     OpenRepository,
+    /// Picking a program to open this file with.
+    OpenWith(PathBuf),
 }
 
 /// Something the user picked in the main area this frame, acted on once drawing is done.
 enum Picked {
     Repository(repository::Pick),
-    /// A changed file in the Commit tab.
-    WorkingFile(String),
+    /// Something done in the Commit tab.
+    Commit(commit_tab::Action),
 }
 
 /// The repository on screen and its history.
@@ -119,6 +123,16 @@ pub struct GitCraftApp {
     layout: RepoLayout,
     /// A history row to bring into view on the next frame.
     scroll_to: Option<usize>,
+    /// A question waiting for the user's answer before something irreversible happens.
+    confirm: Option<Pending>,
+}
+
+/// An action held back until the user confirms it.
+enum Pending {
+    /// Amending a commit that is already on a remote.
+    AmendPushed(Confirm),
+    /// Discarding a file's changes.
+    Discard { path: String, tracked: bool, question: Confirm },
 }
 
 impl GitCraftApp {
@@ -143,11 +157,11 @@ impl GitCraftApp {
             error: worker_error.or(startup_problem),
             menu_bar: menu::laid_out(),
             window_title: APP_NAME.to_string(),
-            // The Commit tab comes first but has nothing to show until Milestone 3.
             tab: MainTab::Repository,
             about_open: false,
             layout,
             scroll_to: None,
+            confirm: None,
         };
         // Reopen the repository from last time. If it has gone (deleted, or on a drive that isn't
         // plugged in), the status bar says so and the welcome page shows.
@@ -172,7 +186,7 @@ impl GitCraftApp {
     /// Runs commands whose keyboard shortcut was pressed this frame. Skipped while a menu or a
     /// dialog has the keyboard, so the keys go to them instead.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if craft_menu::bar::is_open(ctx) || self.dialogs.is_open() || self.about_open {
+        if craft_menu::bar::is_open(ctx) || self.dialogs.is_open() || self.about_open || self.confirm.is_some() {
             return;
         }
         // If the keyboard is on the menu bar (after a tap on Alt), a shortcut leaves it and runs.
@@ -237,7 +251,14 @@ impl GitCraftApp {
                         self.open_folder(path);
                     }
                 }
-                (_, Answer::Unavailable(reason)) => self.error = Some(format!("Could not show the folder picker: {reason}")),
+                (DialogPurpose::OpenWith(file), Answer::Paths(paths)) => {
+                    if let Some(program) = paths.into_iter().next() {
+                        // Remembered for the "Open with" submenu next time.
+                        self.settings.update(|prefs| prefs.open_with.remember(&program));
+                        self.send(Job::Launch(Launch::OpenWith { program, path: file }));
+                    }
+                }
+                (_, Answer::Unavailable(reason)) => self.error = Some(format!("Could not show the file picker: {reason}")),
                 (_, Answer::Cancelled | Answer::Message(_)) => {}
             }
         }
@@ -291,7 +312,7 @@ impl GitCraftApp {
                         // Keep the selected file if it is still changed; otherwise pick the first.
                         let keep = open.changes.selected.as_deref().filter(|path| status.entries.iter().any(|entry| entry.path == *path));
                         let selected = keep.map(str::to_string).or_else(|| status.entries.first().map(|entry| entry.path.clone()));
-                        open.changes.status = Some(status);
+                        open.changes.set_status(status);
                         open.changes.error = None;
                         match selected {
                             // Read again even if it was already shown: the file may have changed.
@@ -312,6 +333,50 @@ impl GitCraftApp {
                 let again = self.open.as_mut().is_some_and(|open| std::mem::take(&mut open.status_again));
                 if again {
                     self.refresh_status();
+                }
+            }
+            Event::Committed { repo, result } => {
+                let Some(open) = self.open.as_mut().filter(|open| open.repo == repo) else {
+                    return;
+                };
+                match result {
+                    Ok(_) => {
+                        open.changes.committed();
+                        // The new commit changes the branch, the history and the working tree:
+                        // read the whole repository again (the saved branch is kept).
+                        let root = open.repo.root().to_path_buf();
+                        self.open_folder(root);
+                    }
+                    Err(error) => {
+                        open.changes.committing = false;
+                        open.changes.commit_error = Some(format!("The commit was not made: {error}"));
+                        // Some changes may have been staged before git stopped.
+                        self.refresh_status();
+                    }
+                }
+            }
+            Event::AmendInfoLoaded { repo, result } => {
+                if let Some(open) = self.open.as_mut().filter(|open| open.repo == repo) {
+                    match result {
+                        Ok(info) => open.changes.take_amend_info(info),
+                        Err(error) => {
+                            open.changes.amend = false;
+                            open.changes.commit_error = Some(format!("Could not read the last commit: {error}"));
+                        }
+                    }
+                }
+            }
+            Event::FilesChanged { repo, result } => {
+                if self.open.as_ref().is_some_and(|open| open.repo == repo) {
+                    if let Err(message) = result {
+                        self.error = Some(message);
+                    }
+                    self.refresh_status();
+                }
+            }
+            Event::Launched { result } => {
+                if let Err(message) = result {
+                    self.error = Some(message);
                 }
             }
             Event::WorkingDiffLoaded { repo, request, result } => {
@@ -517,8 +582,10 @@ impl GitCraftApp {
         egui::Panel::bottom("status_bar").show(ui, |ui| status_bar::show(ui, &status));
         // `take` uses the scroll request once: it is only for the frame after a keyboard move.
         let scroll_to = self.scroll_to.take();
+        // The programs remembered for "Open with" (a handful; read before the panel borrows `self`).
+        let programs = self.settings.get().open_with.programs();
         let pick = egui::CentralPanel::default()
-            .show(ui, |ui| match (self.tab, &self.open) {
+            .show(ui, |ui| match (self.tab, &mut self.open) {
                 (MainTab::Repository, Some(open)) => {
                     let view = repository::BodyView {
                         history: &open.history,
@@ -535,7 +602,9 @@ impl GitCraftApp {
                     repository::welcome(ui);
                     None
                 }
-                (MainTab::Commit, Some(open)) => commit_tab::show(ui, &open.changes, &mut self.layout.changes_ratio).map(Picked::WorkingFile),
+                (MainTab::Commit, Some(open)) => {
+                    commit_tab::show(ui, &mut open.changes, &mut self.layout.changes_ratio, &programs).map(Picked::Commit)
+                }
                 (MainTab::Commit, None) => {
                     ui.centered_and_justified(|ui| {
                         ui.weak("Open a repository to see its changes.");
@@ -555,7 +624,10 @@ impl GitCraftApp {
         match pick {
             Some(Picked::Repository(repository::Pick::Row(row))) => self.select_row(row),
             Some(Picked::Repository(repository::Pick::File(path))) => self.select_file(path),
-            Some(Picked::WorkingFile(path)) => self.select_working_file(path),
+            Some(Picked::Commit(commit_tab::Action::Select(path))) => self.select_working_file(path),
+            Some(Picked::Commit(commit_tab::Action::Commit)) => self.start_commit(false),
+            Some(Picked::Commit(commit_tab::Action::AmendTurnedOn)) => self.turn_on_amend(),
+            Some(Picked::Commit(commit_tab::Action::File { path, command })) => self.run_file_command(ui.ctx(), path, command),
             Some(Picked::Repository(repository::Pick::Commit(id))) => {
                 // A parent link: select it, and bring it into view if it is in the list.
                 self.select_commit(id);
@@ -564,7 +636,113 @@ impl GitCraftApp {
             None => {}
         }
         about::show(ui.ctx(), &mut self.about_open);
+        self.show_confirmation(ui.ctx());
         self.remember_layout();
+    }
+
+    /// Shows the pending question, if any, and acts on the answer.
+    fn show_confirmation(&mut self, ctx: &egui::Context) {
+        let question = match &self.confirm {
+            Some(Pending::AmendPushed(question) | Pending::Discard { question, .. }) => question,
+            None => return,
+        };
+        match confirm::show(ctx, question) {
+            Some(Choice::Confirmed) => self.run_pending(),
+            Some(Choice::Cancelled) => self.confirm = None,
+            None => {}
+        }
+    }
+
+    /// Carries out the action the user just confirmed.
+    fn run_pending(&mut self) {
+        // `take` moves the pending action out (leaving `None`), so it runs exactly once.
+        match self.confirm.take() {
+            Some(Pending::AmendPushed(_)) => self.start_commit(true),
+            Some(Pending::Discard { path, tracked, .. }) => {
+                if let Some(open) = &self.open {
+                    let job = Job::Discard { repo: open.repo.clone(), path, tracked };
+                    self.send(job);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Acts on a choice from a changed file's right-click menu.
+    fn run_file_command(&mut self, ctx: &egui::Context, path: String, command: commit_tab::FileCommand) {
+        use commit_tab::FileCommand;
+        let Some(open) = &self.open else {
+            return;
+        };
+        let full = files::full_path(open.repo.root(), &path);
+        let repo = open.repo.clone();
+        match command {
+            FileCommand::Discard => {
+                if let Some(entry) = open.changes.entry(&path) {
+                    let tracked = entry.kind != gitcraft_git::EntryKind::Untracked;
+                    self.confirm = Some(Pending::Discard { question: commit_tab::discard_question(entry), path, tracked });
+                }
+            }
+            FileCommand::IgnoreFile => self.send(Job::Ignore { repo, line: files::ignore_file_line(&path) }),
+            FileCommand::IgnoreExtension(extension) => self.send(Job::Ignore { repo, line: files::ignore_extension_line(&extension) }),
+            FileCommand::CopyPath => ctx.copy_text(full.display().to_string()),
+            FileCommand::CopyRelativePath => ctx.copy_text(path),
+            FileCommand::Reveal => self.send(Job::Launch(Launch::Reveal(full))),
+            FileCommand::Open => self.send(Job::Launch(Launch::Open(full))),
+            FileCommand::SystemOpenWith => self.send(Job::Launch(Launch::SystemOpenWith(full))),
+            FileCommand::OpenWith(program) => {
+                self.settings.update(|prefs| prefs.open_with.remember(&program));
+                self.send(Job::Launch(Launch::OpenWith { program, path: full }));
+            }
+            FileCommand::ChooseProgram => {
+                if self.dialogs.is_open() {
+                    self.dialogs.raise();
+                    return;
+                }
+                let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+                self.dialogs.ask(FileDialog::open().title(format!("Open {name} with")), DialogPurpose::OpenWith(full));
+            }
+        }
+    }
+
+    /// Amend was ticked: read the last commit (its message, and whether it was pushed).
+    fn turn_on_amend(&mut self) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        open.changes.amend = true;
+        open.changes.amend_info = None;
+        let job = Job::LoadAmendInfo { repo: open.repo.clone() };
+        self.send(job);
+    }
+
+    /// Commits what is ticked in the Commit tab. Amending a commit that is already on a remote
+    /// asks first (unless `confirmed`), since it rewrites published history.
+    fn start_commit(&mut self, confirmed: bool) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let Some(request) = open.changes.commit_request() else {
+            return;
+        };
+        let pushed_to = open.changes.amend_info.as_ref().and_then(|info| info.pushed_to.as_deref());
+        if let (true, false, Some(remote)) = (request.amend, confirmed, pushed_to) {
+            let remote = remote.strip_prefix("refs/remotes/").unwrap_or(remote);
+            self.confirm = Some(Pending::AmendPushed(Confirm {
+                title: "Amend a pushed commit?".into(),
+                body: format!(
+                    "The last commit is already on {remote}. Amending replaces it with a new commit, so the branch will no longer match \
+                     {remote}: pushing it then needs a force push, and anyone who already has the old commit will have to fix up \
+                     their copy."
+                ),
+                action: "Amend anyway".into(),
+            }));
+            return;
+        }
+        open.changes.committing = true;
+        open.changes.commit_error = None;
+        let job = Job::Commit { repo: open.repo.clone(), request };
+        self.send(job);
     }
 
     /// Saves the dividers and "More info" when they change (a drag changes them every frame;
@@ -644,7 +822,8 @@ impl GitCraftApp {
             return;
         };
         // Before the first commit there is no HEAD to compare with, so every file is new.
-        let new_file = entry.is_new() || matches!(open.refs.head, Head::Unborn { .. });
+        let unborn = open.changes.status.as_ref().is_some_and(|status| status.unborn);
+        let new_file = entry.is_new() || unborn;
         let request = WorkingDiffRequest { path: path.clone(), new_file };
         // A different file shows a spinner; the same file (a refresh) keeps its diff on screen
         // until the new one arrives, so it doesn't flicker.
@@ -672,6 +851,7 @@ impl GitCraftApp {
             || craft_menu::bar::is_open(ctx)
             || self.dialogs.is_open()
             || self.about_open
+            || self.confirm.is_some()
             || ctx.memory(|memory| memory.focused().is_some())
             || egui::Popup::is_any_open(ctx);
         let Some(open) = self.open.as_ref().filter(|_| !busy_elsewhere) else {
@@ -1382,6 +1562,182 @@ mod tests {
         settle(&mut app, &ctx);
         assert_eq!(changed_paths(&app), ["first.txt"]);
         assert_eq!(working_diff_lines(&app).unwrap(), [(gitcraft_git::LineKind::Added, "hello".to_string())]);
+    }
+
+    fn changes(app: &mut GitCraftApp) -> &mut Changes {
+        &mut app.open.as_mut().unwrap().changes
+    }
+
+    #[test]
+    fn commits_only_the_ticked_files_and_clears_the_box() {
+        let repo = repo_with_file_changes();
+        std::fs::write(repo.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(repo.path().join("later.txt"), "not yet\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.tab = MainTab::Commit;
+        settle(&mut app, &ctx);
+
+        changes(&mut app).ticks.insert("later.txt".into(), commit_tab::Tick::Nothing);
+        changes(&mut app).summary = "Add line three".into();
+        changes(&mut app).description = "Because three is next.".into();
+        app.start_commit(false);
+        assert!(changes(&mut app).committing);
+        settle(&mut app, &ctx);
+
+        assert_eq!(repo.git(&["log", "-1", "--format=%B"]), "Add line three\n\nBecause three is next.");
+        assert_eq!(repo.git(&["show", "--name-only", "--format=", "HEAD"]), "a.txt");
+        assert_eq!(changed_paths(&app), ["later.txt"], "the unticked file is still waiting");
+        let box_state = changes(&mut app);
+        assert!(box_state.summary.is_empty() && !box_state.committing && box_state.commit_error.is_none());
+        assert_eq!(summaries(&app)[0], "Add line three", "the history shows the new commit");
+    }
+
+    #[test]
+    fn a_refused_commit_says_why_and_keeps_the_message() {
+        let repo = repo_with_file_changes();
+        let hook = repo.path().join(".git").join("hooks").join("pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\necho 'tests failed' >&2\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(repo.path().join("a.txt"), "changed\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+
+        changes(&mut app).summary = "Will be refused".into();
+        app.start_commit(false);
+        settle(&mut app, &ctx);
+        let state = changes(&mut app);
+        assert_eq!(state.summary, "Will be refused");
+        assert!(!state.committing);
+        let error = state.commit_error.clone().unwrap();
+        assert!(error.contains("tests failed"), "{error}");
+        assert_eq!(summaries(&app)[0], "Change both", "no new commit");
+    }
+
+    #[test]
+    fn amending_a_pushed_commit_asks_first() {
+        let origin = repo_with_file_changes();
+        let dir = tempfile::tempdir().unwrap();
+        let clone = dir.path().join("clone");
+        origin.git(&["clone", "-q", origin.path().to_str().unwrap(), clone.to_str().unwrap()]);
+        let clone_str = clone.to_str().unwrap();
+        for (key, value) in [
+            ("user.name", "Test Author"),
+            ("user.email", "test@example.com"),
+            ("commit.gpgsign", "false"),
+            ("core.hooksPath", ".git/hooks"),
+            ("core.autocrlf", "false"),
+        ] {
+            origin.git(&["-C", clone_str, "config", key, value]);
+        }
+        std::fs::write(clone.join("b.txt"), "amended\n").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, clone.clone());
+        app.turn_on_amend();
+        settle(&mut app, &ctx);
+        assert_eq!(changes(&mut app).summary, "Change both", "starts from the last message");
+
+        app.start_commit(false);
+        assert!(matches!(app.confirm, Some(Pending::AmendPushed(_))), "asks before rewriting a pushed commit");
+        assert!(!changes(&mut app).committing);
+
+        // The user confirms.
+        app.confirm = None;
+        app.start_commit(true);
+        settle(&mut app, &ctx);
+        assert_eq!(origin.git(&["-C", clone_str, "rev-list", "--count", "HEAD"]), "2", "replaced, not added");
+        assert_eq!(origin.git(&["-C", clone_str, "show", "HEAD:b.txt"]), "amended");
+    }
+
+    #[test]
+    fn discard_asks_then_recycles_and_restores() {
+        let repo = repo_with_file_changes();
+        std::fs::write(repo.path().join("a.txt"), "edited\n").unwrap();
+        std::fs::write(repo.path().join("scratch.txt"), "throwaway\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+
+        app.run_file_command(&ctx, "a.txt".into(), commit_tab::FileCommand::Discard);
+        match &app.confirm {
+            Some(Pending::Discard { question, .. }) => assert!(question.body.contains("a.txt"), "{}", question.body),
+            _ => panic!("discarding must ask first"),
+        }
+        assert_eq!(std::fs::read_to_string(repo.path().join("a.txt")).unwrap(), "edited\n", "nothing happens before the answer");
+        app.run_pending();
+        settle(&mut app, &ctx);
+        assert_eq!(std::fs::read_to_string(repo.path().join("a.txt")).unwrap(), "one\ntwo\n", "back to the committed version");
+
+        app.run_file_command(&ctx, "scratch.txt".into(), commit_tab::FileCommand::Discard);
+        app.run_pending();
+        settle(&mut app, &ctx);
+        assert!(!repo.path().join("scratch.txt").exists(), "a new file goes to the bin");
+        assert!(changed_paths(&app).is_empty());
+    }
+
+    #[test]
+    fn cancelling_a_discard_changes_nothing() {
+        let repo = repo_with_file_changes();
+        std::fs::write(repo.path().join("a.txt"), "edited\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.run_file_command(&ctx, "a.txt".into(), commit_tab::FileCommand::Discard);
+        app.confirm = None; // what Cancel, Esc or a click outside do
+        settle(&mut app, &ctx);
+        assert_eq!(std::fs::read_to_string(repo.path().join("a.txt")).unwrap(), "edited\n");
+    }
+
+    #[test]
+    fn ignoring_adds_to_gitignore_and_hides_the_file() {
+        let repo = repo_with_file_changes();
+        std::fs::write(repo.path().join("build.log"), "noise\n").unwrap();
+        std::fs::write(repo.path().join("keep.txt"), "x\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        assert_eq!(changed_paths(&app), ["build.log", "keep.txt"]);
+
+        app.run_file_command(&ctx, "build.log".into(), commit_tab::FileCommand::IgnoreExtension("log".into()));
+        settle(&mut app, &ctx);
+        assert_eq!(std::fs::read_to_string(repo.path().join(".gitignore")).unwrap(), "*.log\n");
+        assert_eq!(changed_paths(&app), [".gitignore", "keep.txt"]);
+
+        app.run_file_command(&ctx, "keep.txt".into(), commit_tab::FileCommand::IgnoreFile);
+        settle(&mut app, &ctx);
+        assert_eq!(std::fs::read_to_string(repo.path().join(".gitignore")).unwrap(), "*.log\n/keep.txt\n");
+    }
+
+    #[test]
+    fn a_chosen_program_is_remembered_and_failures_are_reported() {
+        let repo = repo_with_file_changes();
+        std::fs::write(repo.path().join("a.txt"), "edited\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+
+        // The picker "chooses" a program that doesn't exist, so nothing actually opens.
+        let program = repo.path().join("no-such-editor.exe");
+        let answer = program.clone();
+        app.dialogs.set_override(Some(Box::new(move |_request| Answer::Paths(vec![answer.clone()]))));
+        app.run_file_command(&ctx, "a.txt".into(), commit_tab::FileCommand::ChooseProgram);
+        run_frame(&mut app, &ctx, egui::RawInput::default()); // the picker is "shown" at the end of this frame
+        run_frame(&mut app, &ctx, egui::RawInput::default()); // and its answer read in this one
+        settle(&mut app, &ctx);
+
+        assert_eq!(app.settings.get().open_with.programs(), [program]);
+        match app.status_line() {
+            StatusLine::Error(text) => assert!(text.contains("Could not open it with"), "{text}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
     }
 
     #[test]

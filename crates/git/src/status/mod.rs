@@ -3,6 +3,7 @@
 mod parse;
 
 pub use parse::MAX_STATUS_ENTRIES;
+pub(crate) use parse::checked_path;
 
 use crate::command::RunOptions;
 use crate::diff::{DIFF_FORMAT_ARGS, FileDiff, MAX_DIFF_BYTES, MAX_DIFF_LINES, parse_patch};
@@ -95,6 +96,10 @@ pub struct Status {
     pub entries: Vec<StatusEntry>,
     /// More than `MAX_STATUS_ENTRIES` changed files; only the first ones are listed.
     pub truncated: bool,
+    /// The checked-out branch's short name (`main`), or `None` for a detached HEAD.
+    pub branch: Option<String>,
+    /// The branch has no commits yet.
+    pub unborn: bool,
 }
 
 /// Which working-tree file to diff, and against what.
@@ -117,6 +122,7 @@ impl Git {
                 "status",
                 "--porcelain=v2",
                 "-z",
+                "--branch",
                 "--untracked-files=all",
                 // A rename shows as a deleted and an added file, as `git status` shows it until
                 // both are staged. Each half can then be included in a commit on its own.

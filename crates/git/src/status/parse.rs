@@ -35,6 +35,15 @@ pub fn parse_status(output: &[u8]) -> Result<Status> {
                 tracked(record, 10, Some(old))?
             }
             Some(b'u') => unmerged(record)?,
+            Some(b'#') => {
+                // Branch headers (from `--branch`); other headers are skipped.
+                if let Some(oid) = record.strip_prefix("# branch.oid ") {
+                    status.unborn = oid == "(initial)";
+                } else if let Some(head) = record.strip_prefix("# branch.head ") {
+                    status.branch = (head != "(detached)").then(|| head.to_string());
+                }
+                continue;
+            }
             Some(b'?') => StatusEntry {
                 path: checked_path(record.get(2..).unwrap_or(""), record)?,
                 old_path: None,
@@ -113,7 +122,7 @@ fn change(letter: char) -> Option<Change> {
 /// A path from git, checked before it is ever joined to the repository folder: it must be
 /// relative and stay inside the repository. Uses the platform's own rules, so `a:b` is a fine
 /// file name on Linux but a drive on Windows.
-pub(super) fn checked_path(path: &str, record: &str) -> Result<String> {
+pub(crate) fn checked_path(path: &str, record: &str) -> Result<String> {
     let inside = Path::new(path).components().all(|part| matches!(part, Component::Normal(_) | Component::CurDir));
     if path.is_empty() || !inside {
         return Err(malformed(record, "a path outside the repository"));
@@ -141,6 +150,7 @@ mod tests {
     fn reads_every_record_type() {
         let output = [
             "# branch.oid abc\0".to_string(),
+            "# branch.head feature/x\0".to_string(),
             ordinary(".M", "src/main.rs"),
             ordinary("A.", "new file.txt"),
             format!("2 R. N... 100644 100644 100644 {HASH} {HASH} R100 renamed.rs\0old name.rs\0"),
@@ -163,6 +173,16 @@ mod tests {
         );
         assert_eq!(status.entries[2].old_path.as_deref(), Some("old name.rs"));
         assert!(!status.truncated);
+        assert_eq!(status.branch.as_deref(), Some("feature/x"));
+        assert!(!status.unborn);
+    }
+
+    #[test]
+    fn reads_detached_and_unborn_heads() {
+        let detached = parse_status(b"# branch.oid 1234\0# branch.head (detached)\0").unwrap();
+        assert_eq!((detached.branch, detached.unborn), (None, false));
+        let unborn = parse_status(b"# branch.oid (initial)\0# branch.head main\0").unwrap();
+        assert_eq!((unborn.branch.as_deref(), unborn.unborn), (Some("main"), true));
     }
 
     #[test]

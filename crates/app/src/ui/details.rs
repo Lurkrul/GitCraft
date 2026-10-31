@@ -206,14 +206,17 @@ fn files(ui: &mut egui::Ui, details: &CommitDetails, selected_file: Option<&str>
         let letter = file_row::Letter { letter: file.status.letter(), color, tooltip };
         let is_selected = selected_file == Some(file.path.as_str());
         let path_tooltip = file.old_path.as_ref().map(|old| format!("from {old}"));
-        let response = file_row::show(ui, ("changed-file", index), &letter, &file.path, path_tooltip, is_selected, |ui| match file.lines {
-            Some((added, removed)) => {
-                let (added_color, removed_color) = (file_row::added_color(ui), file_row::removed_color(ui));
-                file_row::plain(ui, egui::RichText::new(format!("-{removed}")).color(removed_color));
-                file_row::plain(ui, egui::RichText::new(format!("+{added}")).color(added_color));
-            }
-            None => file_row::plain(ui, egui::RichText::new("binary").weak()),
-        });
+        let response =
+            file_row::show(ui, ("changed-file", index), &letter, file_row::LetterSide::Left, &file.path, path_tooltip, is_selected, |ui| match file
+                .lines
+            {
+                Some((added, removed)) => {
+                    let (added_color, removed_color) = (file_row::added_color(ui), file_row::removed_color(ui));
+                    file_row::plain(ui, egui::RichText::new(format!("-{removed}")).color(removed_color));
+                    file_row::plain(ui, egui::RichText::new(format!("+{added}")).color(added_color));
+                }
+                None => file_row::plain(ui, egui::RichText::new("binary").weak()),
+            });
         if response.clicked() && !is_selected {
             clicked = Some(file.path.clone());
         }

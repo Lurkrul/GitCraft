@@ -22,6 +22,7 @@ egui = { workspace = true }
 egui_extras = { workspace = true }
 gitcraft-git = { workspace = true }
 serde = { workspace = true }
+trash = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -1,7 +1,7 @@
 //! Running git safely: fixed arguments (never a shell), no prompts, a time limit and an output
 //! size limit.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -57,6 +57,16 @@ impl Git {
 
     /// Like [`Git::run`], with explicit limits.
     pub fn run_with(&self, cwd: &Path, args: &[&str], options: &RunOptions) -> Result<Vec<u8>> {
+        self.run_inner(cwd, args, options, None)
+    }
+
+    /// Like [`Git::run_with`], feeding `input` to git's stdin (a commit message, or a list of
+    /// paths for `--pathspec-from-file=-`, which has no command-line length limit).
+    pub fn run_with_input(&self, cwd: &Path, args: &[&str], options: &RunOptions, input: Vec<u8>) -> Result<Vec<u8>> {
+        self.run_inner(cwd, args, options, Some(input))
+    }
+
+    fn run_inner(&self, cwd: &Path, args: &[&str], options: &RunOptions, input: Option<Vec<u8>>) -> Result<Vec<u8>> {
         let mut command = Command::new(self.exe());
         command
             .args(GLOBAL_ARGS)
@@ -73,13 +83,13 @@ impl Git {
             // Paths we pass are file names, never pathspec patterns: a file called ":x" or "*.rs"
             // means exactly that file.
             .env("GIT_LITERAL_PATHSPECS", "1")
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         platform::hide_console(&mut command);
 
         let name = command_name(args);
-        let output = run_process(command, options, &name)?;
+        let output = run_process(command, options, &name, input)?;
         let accepted = output.status.code().is_some_and(|code| options.also_ok.contains(&code));
         if output.status.success() || accepted { Ok(output.stdout) } else { Err(classify_failure(name, cwd, output.status.code(), &output.stderr)) }
     }
@@ -119,7 +129,7 @@ fn classify_failure(command: String, cwd: &Path, code: Option<i32>, stderr: &[u8
 ///
 /// stdout and stderr are each read on their own thread. Reading them one after the other could
 /// deadlock: git would block writing to a full stderr pipe while we wait on stdout.
-pub(crate) fn run_process(mut command: Command, options: &RunOptions, name: &str) -> Result<ProcessOutput> {
+pub(crate) fn run_process(mut command: Command, options: &RunOptions, name: &str, input: Option<Vec<u8>>) -> Result<ProcessOutput> {
     let io_error = |what: &str, source: io::Error| GitError::Io { context: format!("{name}: {what}"), source };
 
     let mut child = command.spawn().map_err(|e| io_error("could not start", e))?;
@@ -134,6 +144,14 @@ pub(crate) fn run_process(mut command: Command, options: &RunOptions, name: &str
     let max_output = options.max_output;
     let stdout_reader = thread::spawn(move || read_capped(stdout, max_output, false));
     let stderr_reader = thread::spawn(move || read_capped(stderr, MAX_STDERR, true));
+    // stdin is written on its own thread too, for the same reason. Dropping the pipe when done
+    // tells git the input has ended. A write error (git exited early) shows up in git's own exit
+    // code, so it is ignored here.
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+    }
 
     let deadline = Instant::now() + options.timeout;
     let status = loop {

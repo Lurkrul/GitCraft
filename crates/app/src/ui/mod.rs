@@ -4,6 +4,7 @@
 pub mod about;
 pub mod commit_list;
 pub mod commit_tab;
+pub mod confirm;
 pub mod details;
 pub mod diff_view;
 pub mod file_row;

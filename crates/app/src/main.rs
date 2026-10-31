@@ -5,6 +5,7 @@
 
 mod app;
 mod commands;
+mod files;
 mod graph;
 mod settings;
 #[cfg(test)]
