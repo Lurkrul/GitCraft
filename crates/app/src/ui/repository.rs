@@ -6,8 +6,12 @@ use gitcraft_git::{LogScope, Ref, Refs};
 
 use crate::commands::Command;
 use crate::graph::History;
-use crate::ui::details::{self, DetailsState};
+use craft_ui::layout::SplitAxis;
+
+use crate::ui::details::{self, DetailsAction, DetailsState};
+use crate::ui::diff_view::{self, DiffState};
 use crate::ui::ref_labels::LabelMap;
+use crate::ui::split::Split;
 use crate::ui::{commit_list, split};
 
 const ALL_BRANCHES: &str = "All branches";
@@ -91,7 +95,6 @@ pub fn toolbar(ui: &mut egui::Ui, root: &Path, refs: &Refs, selected: &LogScope)
     picked
 }
 
-/// The history area, below the toolbar.
 /// What the history area needs to draw.
 pub struct BodyView<'a> {
     pub history: &'a History,
@@ -99,39 +102,83 @@ pub struct BodyView<'a> {
     /// The selected commit's id.
     pub selected: Option<&'a str>,
     pub details: &'a DetailsState,
+    /// The selected file's path, in the details' file list.
+    pub selected_file: Option<&'a str>,
+    pub diff: &'a DiffState,
     /// A row to scroll into view this frame (after keyboard navigation).
     pub scroll_to: Option<usize>,
 }
 
-/// A commit the user picked in the history area this frame.
+/// The user's layout choices for the Repository tab.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepoLayout {
+    /// The history's share of the width.
+    pub history_ratio: f32,
+    /// The details' share of the right pane's height (the diff gets the rest).
+    pub details_ratio: f32,
+    /// Whether the details panel's "More info" is open.
+    pub details_expanded: bool,
+}
+
+impl Default for RepoLayout {
+    fn default() -> Self {
+        RepoLayout { history_ratio: split::DEFAULT_HISTORY_RATIO, details_ratio: split::DEFAULT_DETAILS_RATIO, details_expanded: false }
+    }
+}
+
+/// Something the user picked in the history area this frame.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Pick {
     /// A row of the history list.
     Row(usize),
     /// A commit by id (a parent link in the details panel).
     Commit(String),
+    /// A changed file of the selected commit, by path.
+    File(String),
 }
 
-/// The history area, below the toolbar: the history on the left, the selected commit's details
-/// on the right, with a draggable divider. `split` is the history's share of the width.
-pub fn body(ui: &mut egui::Ui, view: &BodyView<'_>, split: &mut f32, details_expanded: &mut bool) -> Option<Pick> {
+/// The history area, below the toolbar: the history on the left; on the right the selected
+/// commit's details above the selected file's diff. Both dividers can be dragged.
+pub fn body(ui: &mut egui::Ui, view: &BodyView<'_>, layout: &mut RepoLayout) -> Option<Pick> {
     if view.history.log.commits.is_empty() {
         ui.centered_and_justified(|ui| {
             ui.label("This repository has no commits yet.");
         });
         return None;
     }
-    // One variable per pane: both closures are alive at once, and Rust allows only one of them
-    // to borrow a given variable mutably.
-    let (mut row, mut parent) = (None, None);
+    let history_split = Split {
+        id: egui::Id::unique("history-details-split"),
+        axis: SplitAxis::Horizontal,
+        min_pane: 220.0,
+        label: "Resize the history and details",
+    };
+    let details_split =
+        Split { id: egui::Id::unique("details-diff-split"), axis: SplitAxis::Vertical, min_pane: 80.0, label: "Resize the details and the diff" };
+
+    // One variable per pane: the closures are alive at the same time, and Rust allows only one
+    // of them to borrow a given variable mutably.
+    let (mut row, mut action) = (None, None);
+    // `RepoLayout`'s fields are borrowed separately, so each closure can change its own.
+    let RepoLayout { history_ratio, details_ratio, details_expanded } = layout;
     split::two_panes(
         ui,
-        egui::Id::unique("history-details-split"),
-        split,
+        &history_split,
+        history_ratio,
         |ui| row = commit_list::show(ui, view.history, view.labels, view.selected, view.scroll_to),
-        |ui| parent = details::show(ui, view.details, details_expanded),
+        |ui| {
+            split::two_panes(
+                ui,
+                &details_split,
+                details_ratio,
+                |ui| action = details::show(ui, view.details, details_expanded, view.selected_file),
+                |ui| diff_view::show(ui, view.diff, (view.selected, view.selected_file)),
+            );
+        },
     );
-    row.map(Pick::Row).or(parent.map(Pick::Commit))
+    row.map(Pick::Row).or(action.map(|action| match action {
+        DetailsAction::SelectCommit(id) => Pick::Commit(id),
+        DetailsAction::SelectFile(path) => Pick::File(path),
+    }))
 }
 
 /// Shown in the Repository tab while no repository is open.

@@ -65,8 +65,8 @@ repository name (full path on hover and in the window title).
 | R3 | Refs + branch dropdown filtering the history | done |
 | R4 | Lane assignment (pure, tested), graph drawing, ref labels, initials avatars | done |
 | R5 | Two panes (craft-ui split), commit selection, details panel | done |
-| R6 | Diff parsing and diff view | next |
-| R7 | Reopen last repository; remember divider and branch per repository | |
+| R6 | Diff parsing and diff view | done |
+| R7 | Reopen last repository; remember divider and branch per repository | next |
 
 R2 details:
 - File menu: Open Repository… (Ctrl+O), then Exit (added by craft-menu's layout). Help: About GitCraft.
@@ -122,6 +122,24 @@ R5 details:
   files with coloured status letters and +/- counts always follow.
 - The summary tooltip in the list is gone (the panel shows it all).
 - Verified on Windows: merge and ordinary commits, divider drag, parent link, Down arrow.
+
+R6 details:
+- Git layer: `file_diff(repo, DiffRequest)` runs `git diff-tree -p` for one file against the first
+  parent (or `--root`), with `--no-ext-diff --no-textconv --no-color` and fixed `a/` `b/` prefixes,
+  so the user's config can neither change the output nor run programs. Renames pass both paths.
+  Output is capped at 4 MiB (an over-limit diff shows "too large to show") and 20,000 lines
+  (`truncated`). A pure parser builds hunks of numbered lines, handling binary files, "no newline"
+  markers, CRLF, and over-long lines (cut at 2,000 characters). It never fails.
+- All git commands now set `GIT_LITERAL_PATHSPECS=1`, so file names are never read as patterns.
+  A test with `weird[1].txt` next to a `weird1.txt` decoy proves it.
+- The right pane is split vertically (details above, diff below), and both dividers can be dragged.
+  `RepoLayout` holds both ratios and the "More info" flag (in memory; R7 saves them).
+- Selecting a commit loads its details and then automatically its first file's diff. Clicking a file
+  in the list shows its diff. Late results for an earlier commit or file are ignored.
+- Diff view: old and new line numbers, +/- markers, green and red tints, hunk headers, tabs as 4 spaces,
+  horizontal scrolling for long lines. Only visible rows are laid out. Each commit and file starts
+  scrolled to the top (scroll areas have their own ids).
+- Verified on Windows: auto-selected first file, clicking another file, a new file shown all green.
 
 ## Open questions
 

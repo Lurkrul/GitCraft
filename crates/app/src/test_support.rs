@@ -26,6 +26,15 @@ impl TestRepo {
         self.dir.path()
     }
 
+    /// Writes files (path, contents) and commits them with `message`.
+    pub fn commit_files(&self, files: &[(&str, &str)], message: &str) {
+        for (path, contents) in files {
+            std::fs::write(self.path().join(path), contents).unwrap();
+        }
+        self.git(&["add", "."]);
+        self.git(&["commit", "-q", "-m", message]);
+    }
+
     /// Runs git with the user's own config shut out (it could require signed commits).
     pub fn git(&self, args: &[&str]) {
         let output = Command::new("git")

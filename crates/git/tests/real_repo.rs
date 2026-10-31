@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use gitcraft_git::{FileStatus, Git, GitError, Head, LogScope, RefKind};
+use gitcraft_git::{DiffRequest, FileStatus, Git, GitError, Head, LineKind, LogScope, RefKind};
 
 /// A throwaway repository. Both folders are deleted when this is dropped.
 struct TestRepo {
@@ -368,4 +368,86 @@ fn commit_details_need_a_full_hash() {
     assert!(matches!(git.commit_details(&opened, "--output=x"), Err(GitError::Malformed { .. })));
     // Well-formed but not in this repository: git's own error.
     assert!(matches!(git.commit_details(&opened, &"0".repeat(40)), Err(GitError::CommandFailed { .. })));
+}
+
+fn diff_request(commit: &str, parent: Option<&str>, path: &str, old_path: Option<&str>) -> DiffRequest {
+    DiffRequest { commit: commit.into(), parent: parent.map(Into::into), path: path.into(), old_path: old_path.map(Into::into) }
+}
+
+#[test]
+fn file_diffs_for_edits_new_files_renames_and_binaries() {
+    let repo = TestRepo::new();
+    std::fs::write(repo.path().join("notes.txt"), "one\ntwo\nthree\n").unwrap();
+    std::fs::write(repo.path().join("old-name.txt"), "unchanged content\n").unwrap();
+    std::fs::write(repo.path().join("pic.bin"), [0u8, 1, 2]).unwrap();
+    repo.git(&["add", "."]);
+    let root = repo.commit("Root");
+
+    std::fs::write(repo.path().join("notes.txt"), "one\n2\nthree\nfour\n").unwrap();
+    repo.git(&["mv", "old-name.txt", "new-name.txt"]);
+    std::fs::write(repo.path().join("pic.bin"), [0u8, 9, 9, 9]).unwrap();
+    repo.git(&["add", "."]);
+    let second = repo.commit("Second");
+
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+
+    // An edit: one line changed, one added.
+    let diff = git.file_diff(&opened, &diff_request(&second, Some(&root), "notes.txt", None)).unwrap();
+    assert_eq!(diff.hunks.len(), 1);
+    let changes: Vec<_> = diff.hunks[0].lines.iter().filter(|l| l.kind != LineKind::Context).map(|l| (l.kind, l.text.as_str())).collect();
+    assert_eq!(changes, [(LineKind::Removed, "two"), (LineKind::Added, "2"), (LineKind::Added, "four")]);
+
+    // A root commit: the whole file is added.
+    let diff = git.file_diff(&opened, &diff_request(&root, None, "notes.txt", None)).unwrap();
+    assert!(diff.hunks[0].lines.iter().all(|l| l.kind == LineKind::Added));
+    assert_eq!(diff.hunks[0].lines.len(), 3);
+
+    // A pure rename has no line changes, and asking with both paths is fine.
+    let diff = git.file_diff(&opened, &diff_request(&second, Some(&root), "new-name.txt", Some("old-name.txt"))).unwrap();
+    assert!(diff.hunks.is_empty() && !diff.binary);
+
+    // A binary file.
+    let diff = git.file_diff(&opened, &diff_request(&second, Some(&root), "pic.bin", None)).unwrap();
+    assert!(diff.binary);
+}
+
+#[test]
+fn file_names_that_look_like_pathspec_magic_are_taken_literally() {
+    let repo = TestRepo::new();
+    // As a pattern, "weird[1].txt" would also match "weird1.txt" ([1] is a character class).
+    // Taken literally it names only itself. (Brackets work on every platform; ":" and "*" can't
+    // appear in Windows file names.)
+    let name = "weird[1].txt";
+    std::fs::write(repo.path().join(name), "a\n").unwrap();
+    std::fs::write(repo.path().join("weird1.txt"), "decoy\n").unwrap();
+    repo.git(&["add", "."]);
+    let root = repo.commit("Root");
+
+    let git = git();
+    let diff = git.file_diff(&git.open_repo(repo.path()).unwrap(), &diff_request(&root, None, name, None)).unwrap();
+    let texts: Vec<_> = diff.hunks.iter().flat_map(|h| &h.lines).map(|l| l.text.as_str()).collect();
+    assert_eq!(texts, ["a"], "only the named file, not the decoy");
+}
+
+#[test]
+fn oversized_diffs_are_refused() {
+    let repo = TestRepo::new();
+    let big = "x".repeat(100).repeat(50_000); // ~5 MB on one line
+    std::fs::write(repo.path().join("big.txt"), &big).unwrap();
+    repo.git(&["add", "."]);
+    let root = repo.commit("Big");
+    let git = git();
+    let err = git.file_diff(&git.open_repo(repo.path()).unwrap(), &diff_request(&root, None, "big.txt", None)).unwrap_err();
+    assert!(matches!(err, GitError::OutputTooLarge { .. }), "{err:?}");
+}
+
+#[test]
+fn file_diffs_need_full_hashes() {
+    let repo = TestRepo::new();
+    let root = repo.commit("Root");
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    assert!(matches!(git.file_diff(&opened, &diff_request("HEAD", None, "x", None)), Err(GitError::Malformed { .. })));
+    assert!(matches!(git.file_diff(&opened, &diff_request(&root, Some("--cached"), "x", None)), Err(GitError::Malformed { .. })));
 }

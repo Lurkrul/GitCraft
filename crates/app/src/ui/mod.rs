@@ -4,6 +4,7 @@
 pub mod about;
 pub mod commit_list;
 pub mod details;
+pub mod diff_view;
 pub mod menu;
 pub mod placeholder;
 pub mod ref_labels;

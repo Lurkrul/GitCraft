@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
-use gitcraft_git::{CommitDetails, DEFAULT_LOG_LIMIT, Git, GitError, LogScope, Refs, Repo};
+use gitcraft_git::{CommitDetails, DEFAULT_LOG_LIMIT, DiffRequest, FileDiff, Git, GitError, LogScope, Refs, Repo};
 
 use crate::graph::History;
 
@@ -28,6 +28,8 @@ pub enum Job {
     LoadLog { repo: Repo, scope: LogScope },
     /// Read one commit in full (message, people, changed files) for the details panel.
     LoadDetails { repo: Repo, id: String },
+    /// Read one changed file's diff for the diff view.
+    LoadDiff { repo: Repo, request: DiffRequest },
 }
 
 /// What the background thread reports back. Each [`Job`] produces exactly one event. Events say
@@ -40,6 +42,7 @@ pub enum Event {
     LogLoaded { repo: Repo, scope: LogScope, history: History },
     LogFailed { repo: Repo, scope: LogScope, error: GitError },
     DetailsLoaded { repo: Repo, id: String, result: Result<CommitDetails, GitError> },
+    DiffLoaded { repo: Repo, request: DiffRequest, result: Result<FileDiff, GitError> },
 }
 
 /// The UI's handle on the background thread. Dropping it closes the job channel, which ends the
@@ -126,6 +129,10 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, wake: Wake) {
             Job::LoadDetails { repo, id } => {
                 let result = located(&mut git).and_then(|git| git.commit_details(&repo, &id));
                 Event::DetailsLoaded { repo, id, result }
+            }
+            Job::LoadDiff { repo, request } => {
+                let result = located(&mut git).and_then(|git| git.file_diff(&repo, &request));
+                Event::DiffLoaded { repo, request, result }
             }
         };
         if events.send(event).is_err() {

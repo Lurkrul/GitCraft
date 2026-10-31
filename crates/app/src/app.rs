@@ -7,16 +7,18 @@ use std::time::Instant;
 use craft_dialogs::{Answer, Dialogs, FileDialog};
 use craft_menu::MenuBar;
 use craft_settings::{SaveStatus, SettingsStore};
-use gitcraft_git::{DEFAULT_LOG_LIMIT, LogScope, Refs, Repo};
+use gitcraft_git::{DEFAULT_LOG_LIMIT, DiffRequest, LogScope, Refs, Repo};
 
 use crate::commands::Command;
 use crate::graph::History;
 use crate::settings::Prefs;
 use crate::ui::details::DetailsState;
+use crate::ui::diff_view::{self, DiffState, DiffView};
 use crate::ui::ref_labels::{self, LabelMap};
+use crate::ui::repository::RepoLayout;
 use crate::ui::status_bar::StatusLine;
 use crate::ui::tabs::MainTab;
-use crate::ui::{about, menu, placeholder, repository, split, status_bar, tabs};
+use crate::ui::{about, menu, placeholder, repository, status_bar, tabs};
 use crate::worker::{Event, Job, Worker};
 
 /// The product name, used for the window title and messages.
@@ -45,13 +47,27 @@ struct OpenRepo {
     selected: Option<String>,
     /// The selected commit's details, for the right pane.
     details: DetailsState,
+    /// The selected file of that commit, and its diff.
+    selected_file: Option<String>,
+    diff: DiffState,
 }
 
 impl OpenRepo {
     fn new(repo: Repo, refs: Refs, history: History) -> OpenRepo {
         let labels = ref_labels::label_map(&refs);
         let scope = LogScope::AllBranches;
-        OpenRepo { repo, refs, labels, history, selected_scope: scope.clone(), log_scope: scope, selected: None, details: DetailsState::Empty }
+        OpenRepo {
+            repo,
+            refs,
+            labels,
+            history,
+            selected_scope: scope.clone(),
+            log_scope: scope,
+            selected: None,
+            details: DetailsState::Empty,
+            selected_file: None,
+            diff: DiffState::Empty,
+        }
     }
 
     /// The row of the selected commit in the current history, if it is in it.
@@ -76,12 +92,10 @@ pub struct GitCraftApp {
     window_title: String,
     tab: MainTab,
     about_open: bool,
-    /// The history pane's share of the width in the Repository tab.
-    split: f32,
+    /// The Repository tab's divider positions and "More info" choice.
+    layout: RepoLayout,
     /// A history row to bring into view on the next frame.
     scroll_to: Option<usize>,
-    /// Whether the details panel's "More info" is open. Kept as the user moves between commits.
-    details_expanded: bool,
 }
 
 impl GitCraftApp {
@@ -107,9 +121,8 @@ impl GitCraftApp {
             // The Commit tab comes first but has nothing to show until Milestone 3.
             tab: MainTab::Repository,
             about_open: false,
-            split: split::DEFAULT_RATIO,
+            layout: RepoLayout::default(),
             scroll_to: None,
-            details_expanded: false,
         }
     }
 
@@ -234,16 +247,40 @@ impl GitCraftApp {
                     if open.selected_row().is_none() {
                         open.selected = None;
                         open.details = DetailsState::Empty;
+                        open.selected_file = None;
+                        open.diff = DiffState::Empty;
                     }
                     self.error = None;
                 }
             }
             Event::DetailsLoaded { repo, id, result } => {
                 // Only for the commit still selected: the user may have clicked on since.
+                let mut first_file = None;
                 if let Some(open) = self.open.as_mut().filter(|open| open.repo == repo && open.selected.as_deref() == Some(id.as_str())) {
                     open.details = match result {
-                        Ok(details) => DetailsState::Loaded(Box::new(details)),
+                        Ok(details) => {
+                            first_file = details.files.first().map(|file| file.path.clone());
+                            DetailsState::Loaded(Box::new(details))
+                        }
                         Err(error) => DetailsState::Failed(format!("Could not read this commit: {error}")),
+                    };
+                }
+                // Show the first file's changes straight away, so a click on a commit shows a diff.
+                if let Some(path) = first_file {
+                    self.select_file(path);
+                }
+            }
+            Event::DiffLoaded { repo, request, result } => {
+                // Only for the file still selected, in the commit still selected.
+                let current = |open: &&mut OpenRepo| {
+                    open.repo == repo
+                        && open.selected.as_deref() == Some(request.commit.as_str())
+                        && open.selected_file.as_deref() == Some(request.path.as_str())
+                };
+                if let Some(open) = self.open.as_mut().filter(current) {
+                    open.diff = match result {
+                        Ok(diff) => DiffState::Loaded(Box::new(DiffView::new(diff))),
+                        Err(error) => DiffState::Failed(diff_view::failure_message(&error)),
                     };
                 }
             }
@@ -385,9 +422,11 @@ impl GitCraftApp {
                         labels: &open.labels,
                         selected: open.selected.as_deref(),
                         details: &open.details,
+                        selected_file: open.selected_file.as_deref(),
+                        diff: &open.diff,
                         scroll_to,
                     };
-                    repository::body(ui, &view, &mut self.split, &mut self.details_expanded)
+                    repository::body(ui, &view, &mut self.layout)
                 }
                 (MainTab::Repository, None) => {
                     repository::welcome(ui);
@@ -409,6 +448,7 @@ impl GitCraftApp {
             .inner;
         match pick {
             Some(repository::Pick::Row(row)) => self.select_row(row),
+            Some(repository::Pick::File(path)) => self.select_file(path),
             Some(repository::Pick::Commit(id)) => {
                 // A parent link: select it, and bring it into view if it is in the list.
                 self.select_commit(id);
@@ -437,7 +477,30 @@ impl GitCraftApp {
         }
         open.selected = Some(id.clone());
         open.details = DetailsState::Loading;
+        open.selected_file = None;
+        open.diff = DiffState::Empty;
         let job = Job::LoadDetails { repo: open.repo.clone(), id };
+        self.send(job);
+    }
+
+    /// Selects one of the selected commit's changed files and starts reading its diff.
+    fn select_file(&mut self, path: String) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        // The request needs the commit's parent and the file's old name (for a rename), which
+        // come from the loaded details.
+        let (DetailsState::Loaded(details), Some(commit)) = (&open.details, &open.selected) else {
+            return;
+        };
+        let Some(file) = details.files.iter().find(|file| file.path == path) else {
+            return;
+        };
+        let request =
+            DiffRequest { commit: commit.clone(), parent: details.parents.first().cloned(), path: path.clone(), old_path: file.old_path.clone() };
+        open.selected_file = Some(path);
+        open.diff = DiffState::Loading;
+        let job = Job::LoadDiff { repo: open.repo.clone(), request };
         self.send(job);
     }
 
@@ -870,6 +933,81 @@ mod tests {
         run_frame(&mut app, &ctx, egui::RawInput::default());
         run_frame(&mut app, &ctx, egui::RawInput::default());
         assert!(loaded_message(&app).is_some());
+    }
+
+    /// The diff on screen as (kind, text) pairs, hunk headers left out.
+    fn diff_lines(app: &GitCraftApp) -> Option<Vec<(gitcraft_git::LineKind, String)>> {
+        match &app.open.as_ref()?.diff {
+            DiffState::Loaded(view) => Some(
+                view.rows
+                    .iter()
+                    .filter_map(|row| match row {
+                        diff_view::DiffRow::Line { kind, text, .. } => Some((*kind, text.clone())),
+                        diff_view::DiffRow::Hunk(_) => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// A repository with one commit that changes two files.
+    fn repo_with_file_changes() -> TestRepo {
+        let repo = TestRepo::with_commits(&[]);
+        repo.commit_files(&[("a.txt", "one\n"), ("b.txt", "first\n")], "Add files");
+        repo.commit_files(&[("a.txt", "one\ntwo\n"), ("b.txt", "second\n")], "Change both");
+        repo
+    }
+
+    #[test]
+    fn selecting_a_commit_shows_its_first_file_diff() {
+        let repo = repo_with_file_changes();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+
+        app.select_row(0);
+        settle(&mut app, &ctx);
+        assert_eq!(app.open.as_ref().unwrap().selected_file.as_deref(), Some("a.txt"));
+        use gitcraft_git::LineKind::{Added, Context, Removed};
+        assert_eq!(diff_lines(&app), Some(vec![(Context, "one".into()), (Added, "two".into())]));
+
+        app.select_file("b.txt".into());
+        settle(&mut app, &ctx);
+        assert_eq!(diff_lines(&app), Some(vec![(Removed, "first".into()), (Added, "second".into())]));
+        // Draw it all once more, diff included.
+        run_frame(&mut app, &ctx, egui::RawInput::default());
+    }
+
+    #[test]
+    fn a_new_commit_selection_drops_the_old_diff() {
+        let repo = repo_with_file_changes();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+
+        app.select_row(0);
+        settle(&mut app, &ctx);
+        // Pick the older commit; whatever was on screen for the newer one must go.
+        app.select_row(1);
+        assert!(matches!(app.open.as_ref().unwrap().diff, DiffState::Empty));
+        settle(&mut app, &ctx);
+        let open = app.open.as_ref().unwrap();
+        assert_eq!(open.selected_file.as_deref(), Some("a.txt"));
+        use gitcraft_git::LineKind::Added;
+        assert_eq!(diff_lines(&app), Some(vec![(Added, "one".into())]), "the root commit adds the whole file");
+    }
+
+    #[test]
+    fn selecting_a_file_that_is_not_in_the_commit_does_nothing() {
+        let repo = repo_with_file_changes();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.select_row(0);
+        settle(&mut app, &ctx);
+        app.select_file("missing.txt".into());
+        assert_eq!(app.open.as_ref().unwrap().selected_file.as_deref(), Some("a.txt"));
     }
 
     #[test]

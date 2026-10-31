@@ -19,9 +19,18 @@ pub enum DetailsState {
     Failed(String),
 }
 
+/// Something the user picked in the panel.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DetailsAction {
+    /// A parent commit link.
+    SelectCommit(String),
+    /// A changed file, to show its diff.
+    SelectFile(String),
+}
+
 /// Draws the panel. `expanded` is whether "More info" is open (the user's choice, kept from
-/// commit to commit). Returns a commit to select if the user clicked one of the parents.
-pub fn show(ui: &mut egui::Ui, state: &DetailsState, expanded: &mut bool) -> Option<String> {
+/// commit to commit); `selected_file` is highlighted in the file list.
+pub fn show(ui: &mut egui::Ui, state: &DetailsState, expanded: &mut bool, selected_file: Option<&str>) -> Option<DetailsAction> {
     match state {
         DetailsState::Empty => {
             centered(ui, |ui| {
@@ -42,12 +51,15 @@ pub fn show(ui: &mut egui::Ui, state: &DetailsState, expanded: &mut bool) -> Opt
         }
         DetailsState::Loaded(details) => {
             egui::ScrollArea::vertical()
+                // Its own id (two scroll areas in one pane must not share one), per commit, so each
+                // commit's details start at the top.
+                .id_salt(("commit-details", &details.id))
                 .auto_shrink(false)
                 // Room on the right so the line counts never sit under the scroll bar.
                 .show(ui, |ui| {
                     egui::Frame::new()
                         .inner_margin(egui::Margin { left: 8, right: 16, top: 0, bottom: 8 })
-                        .show(ui, |ui| loaded(ui, details, expanded))
+                        .show(ui, |ui| loaded(ui, details, expanded, selected_file))
                         .inner
                 })
                 .inner
@@ -65,7 +77,7 @@ fn centered(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui)) {
 /// Description lines shown before "More info" is opened.
 const COLLAPSED_LINES: usize = 3;
 
-fn loaded(ui: &mut egui::Ui, details: &CommitDetails, expanded: &mut bool) -> Option<String> {
+fn loaded(ui: &mut egui::Ui, details: &CommitDetails, expanded: &mut bool, selected_file: Option<&str>) -> Option<DetailsAction> {
     ui.add_space(4.0);
     let (summary, body) = split_message(&details.message);
     ui.add(egui::Label::new(egui::RichText::new(summary).strong().size(15.0)).wrap().selectable(true));
@@ -98,8 +110,8 @@ fn loaded(ui: &mut egui::Ui, details: &CommitDetails, expanded: &mut bool) -> Op
 
     ui.add_space(8.0);
     ui.separator();
-    files(ui, details);
-    clicked_parent
+    let clicked_file = files(ui, details, selected_file);
+    clicked_parent.map(DetailsAction::SelectCommit).or(clicked_file.map(DetailsAction::SelectFile))
 }
 
 /// The description for the collapsed view: blank lines dropped, so all of the few lines shown
@@ -176,35 +188,64 @@ pub fn files_summary(files: &[ChangedFile]) -> String {
     format!("{} {noun} changed, +{added} -{removed}", files.len())
 }
 
-fn files(ui: &mut egui::Ui, details: &CommitDetails) {
+/// The changed files, each clickable to show its diff. Returns the file clicked, if any.
+fn files(ui: &mut egui::Ui, details: &CommitDetails, selected_file: Option<&str>) -> Option<String> {
     if details.files.is_empty() {
         ui.weak("No files changed.");
-        return;
+        return None;
     }
     ui.label(files_summary(&details.files));
     if details.parents.len() > 1 {
         ui.weak("Compared with the first parent.");
     }
     ui.add_space(4.0);
-    for file in &details.files {
-        ui.horizontal(|ui| {
-            let (letter_color, tooltip) = status_style(ui, file.status);
-            ui.label(egui::RichText::new(file.status.letter().to_string()).monospace().strong().color(letter_color)).on_hover_text(tooltip);
-            let path = ui.add(egui::Label::new(&file.path).truncate());
-            if let Some(old) = &file.old_path {
-                path.on_hover_text(format!("from {old}"));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match file.lines {
-                Some((added, removed)) => {
-                    ui.label(egui::RichText::new(format!("-{removed}")).color(removed_color(ui)));
-                    ui.label(egui::RichText::new(format!("+{added}")).color(added_color(ui)));
+    let mut clicked = None;
+    for (index, file) in details.files.iter().enumerate() {
+        // A placeholder shape, filled in once we know the row's size and whether it is hovered.
+        // (Painting the highlight after the row would cover its text.)
+        let background = ui.painter().add(egui::Shape::Noop);
+        let row = ui
+            .horizontal(|ui| {
+                let (letter_color, tooltip) = status_style(ui, file.status);
+                // Labels are not selectable here, so a click selects the file instead of text.
+                ui.add(
+                    egui::Label::new(egui::RichText::new(file.status.letter().to_string()).monospace().strong().color(letter_color))
+                        .selectable(false),
+                )
+                .on_hover_text(tooltip);
+                let path = ui.add(egui::Label::new(&file.path).truncate().selectable(false));
+                if let Some(old) = &file.old_path {
+                    path.on_hover_text(format!("from {old}"));
                 }
-                None => {
-                    ui.weak("binary");
-                }
-            });
-        });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match file.lines {
+                    Some((added, removed)) => {
+                        ui.add(egui::Label::new(egui::RichText::new(format!("-{removed}")).color(removed_color(ui))).selectable(false));
+                        ui.add(egui::Label::new(egui::RichText::new(format!("+{added}")).color(added_color(ui))).selectable(false));
+                    }
+                    None => {
+                        ui.add(egui::Label::new(egui::RichText::new("binary").weak()).selectable(false));
+                    }
+                });
+            })
+            .response;
+        let response =
+            ui.interact(row.rect, ui.scope_id().with(("changed-file", index)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let is_selected = selected_file == Some(file.path.as_str());
+        let fill = if is_selected {
+            Some(ui.visuals().selection.bg_fill)
+        } else if response.hovered() {
+            Some(ui.visuals().widgets.hovered.weak_bg_fill)
+        } else {
+            None
+        };
+        if let Some(fill) = fill {
+            ui.painter().set(background, egui::epaint::RectShape::filled(row.rect.expand(1.0), 2.0, fill));
+        }
+        if response.clicked() && !is_selected {
+            clicked = Some(file.path.clone());
+        }
     }
+    clicked
 }
 
 fn added_color(ui: &egui::Ui) -> egui::Color32 {
@@ -295,7 +336,7 @@ mod tests {
             for _ in 0..2 {
                 let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
                     for mut expanded in [false, true] {
-                        assert_eq!(show(ui, state, &mut expanded), None, "nothing clicked without input");
+                        assert_eq!(show(ui, state, &mut expanded, Some("f")), None, "nothing clicked without input");
                     }
                 });
                 output.textures_delta.clear();

@@ -67,6 +67,9 @@ impl Git {
             // Read-only commands shouldn't take the index lock, so they never block the user's
             // own git commands running at the same time.
             .env("GIT_OPTIONAL_LOCKS", "0")
+            // Paths we pass are file names, never pathspec patterns: a file called ":x" or "*.rs"
+            // means exactly that file.
+            .env("GIT_LITERAL_PATHSPECS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

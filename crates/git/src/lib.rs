@@ -18,6 +18,7 @@
 
 mod command;
 mod details;
+mod diff;
 mod error;
 mod hash;
 mod locate;
@@ -28,6 +29,7 @@ mod repo;
 
 pub use command::RunOptions;
 pub use details::{ChangedFile, CommitDetails, FileStatus};
+pub use diff::{DiffLine, DiffRequest, FileDiff, Hunk, LineKind, MAX_DIFF_BYTES, MAX_DIFF_LINES};
 pub use error::{GitError, Result};
 pub use locate::Git;
 pub use log::{Commit, DEFAULT_LOG_LIMIT, Log, LogScope};
