@@ -3,16 +3,19 @@
 /// The app's main areas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainTab {
+    /// Status, staging and creating commits (Milestone 3).
+    Commit,
     Repository,
     Issues,
     Projects,
 }
 
 impl MainTab {
-    pub const ALL: [MainTab; 3] = [MainTab::Repository, MainTab::Issues, MainTab::Projects];
+    pub const ALL: [MainTab; 4] = [MainTab::Commit, MainTab::Repository, MainTab::Issues, MainTab::Projects];
 
     pub fn label(self) -> &'static str {
         match self {
+            MainTab::Commit => "Commit",
             MainTab::Repository => "Repository",
             MainTab::Issues => "Issues",
             MainTab::Projects => "Projects",
@@ -22,6 +25,7 @@ impl MainTab {
     /// A stable id for egui, independent of the (one day translated) label.
     fn id_salt(self) -> &'static str {
         match self {
+            MainTab::Commit => "tab-commit",
             MainTab::Repository => "tab-repository",
             MainTab::Issues => "tab-issues",
             MainTab::Projects => "tab-projects",
@@ -70,7 +74,7 @@ mod tests {
 
     #[test]
     fn labels_are_distinct() {
-        assert_eq!(MainTab::ALL.map(MainTab::label), ["Repository", "Issues", "Projects"]);
+        assert_eq!(MainTab::ALL.map(MainTab::label), ["Commit", "Repository", "Issues", "Projects"]);
     }
 
     #[test]

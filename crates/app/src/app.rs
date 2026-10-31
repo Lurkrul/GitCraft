@@ -70,6 +70,7 @@ impl GitCraftApp {
             error: worker_error.or(startup_problem),
             menu_bar: menu::laid_out(),
             window_title: APP_NAME.to_string(),
+            // The Commit tab comes first but has nothing to show until Milestone 3.
             tab: MainTab::Repository,
             about_open: false,
         }
@@ -279,6 +280,7 @@ impl GitCraftApp {
         egui::CentralPanel::default().show(ui, |ui| match (self.tab, &self.open) {
             (MainTab::Repository, Some(open)) => repository::body(ui, &open.log.commits),
             (MainTab::Repository, None) => repository::welcome(ui),
+            (MainTab::Commit, _) => placeholder::coming_later(ui, "Committing", 3),
             (MainTab::Issues, _) => placeholder::coming_later(ui, "Issues", 5),
             (MainTab::Projects, _) => placeholder::coming_later(ui, "Projects", 6),
         });
