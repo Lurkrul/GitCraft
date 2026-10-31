@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use gitcraft_git::{DEFAULT_LOG_LIMIT, Git, GitError};
+use gitcraft_git::{DEFAULT_LOG_LIMIT, Git, GitError, LogScope};
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
@@ -30,7 +30,7 @@ fn run(folder: PathBuf, limit: usize) -> Result<(), GitError> {
     let repo = git.open_repo(&folder)?;
     println!("repository: {}", repo.root().display());
 
-    let log = git.log(&repo, limit)?;
+    let log = git.log(&repo, &LogScope::AllBranches, limit)?;
     for commit in &log.commits {
         let merge = if commit.is_merge() { " (merge)" } else { "" };
         println!("{} {:>10} {:<20} {}{merge}", commit.short_id(), commit.author_time, commit.author_name, commit.summary);

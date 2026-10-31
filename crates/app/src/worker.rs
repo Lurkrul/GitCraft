@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
-use gitcraft_git::{DEFAULT_LOG_LIMIT, Git, GitError, Log, Repo};
+use gitcraft_git::{DEFAULT_LOG_LIMIT, Git, GitError, Log, LogScope, Refs, Repo};
 
 /// Called by the worker after each event, to make the UI repaint (and so poll) right away.
 /// `Arc<dyn Fn ...>` is a shared, thread-safe function object, like `std::shared_ptr<std::function<void()>>`.
@@ -19,15 +19,22 @@ pub type Wake = Arc<dyn Fn() + Send + Sync>;
 /// Work for the background thread.
 #[derive(Debug)]
 pub enum Job {
-    /// Open the repository containing this folder and read its history.
+    /// Open the repository containing this folder and read its refs and its history (all
+    /// branches).
     Open(PathBuf),
+    /// Read the history of an open repository again, in another scope (such as one branch).
+    LoadLog { repo: Repo, scope: LogScope },
 }
 
-/// What the background thread reports back. Each [`Job`] produces exactly one event.
+/// What the background thread reports back. Each [`Job`] produces exactly one event. Events say
+/// which repository and scope they are for, so the UI can ignore ones that arrive after the user
+/// has already moved on.
 #[derive(Debug)]
 pub enum Event {
-    Opened { repo: Repo, log: Log },
-    Failed { path: PathBuf, error: GitError },
+    Opened { repo: Repo, refs: Refs, log: Log },
+    OpenFailed { path: PathBuf, error: GitError },
+    LogLoaded { repo: Repo, scope: LogScope, log: Log },
+    LogFailed { repo: Repo, scope: LogScope, error: GitError },
 }
 
 /// The UI's handle on the background thread. Dropping it closes the job channel, which ends the
@@ -104,8 +111,12 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, wake: Wake) {
     for job in jobs {
         let event = match job {
             Job::Open(path) => match open(&mut git, &path) {
-                Ok((repo, log)) => Event::Opened { repo, log },
-                Err(error) => Event::Failed { path, error },
+                Ok((repo, refs, log)) => Event::Opened { repo, refs, log },
+                Err(error) => Event::OpenFailed { path, error },
+            },
+            Job::LoadLog { repo, scope } => match located(&mut git).and_then(|git| git.log(&repo, &scope, DEFAULT_LOG_LIMIT)) {
+                Ok(log) => Event::LogLoaded { repo, scope, log },
+                Err(error) => Event::LogFailed { repo, scope, error },
             },
         };
         if events.send(event).is_err() {
@@ -115,11 +126,12 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, wake: Wake) {
     }
 }
 
-fn open(git: &mut Option<Git>, path: &std::path::Path) -> Result<(Repo, Log), GitError> {
+fn open(git: &mut Option<Git>, path: &std::path::Path) -> Result<(Repo, Refs, Log), GitError> {
     let git = located(git)?;
     let repo = git.open_repo(path)?;
-    let log = git.log(&repo, DEFAULT_LOG_LIMIT)?;
-    Ok((repo, log))
+    let refs = git.refs(&repo)?;
+    let log = git.log(&repo, &LogScope::AllBranches, DEFAULT_LOG_LIMIT)?;
+    Ok((repo, refs, log))
 }
 
 /// The cached `Git`, locating it first if needed.
@@ -158,9 +170,10 @@ mod tests {
         assert!(worker.is_busy());
 
         match next_event(&mut worker) {
-            Event::Opened { log, .. } => {
+            Event::Opened { log, refs, .. } => {
                 let summaries: Vec<_> = log.commits.iter().map(|c| c.summary.as_str()).collect();
                 assert_eq!(summaries, ["Second", "First"]);
+                assert_eq!(refs.head_branch(), Some("refs/heads/main"));
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -174,7 +187,7 @@ mod tests {
         let mut worker = worker();
         worker.send(Job::Open(dir.path().to_path_buf()));
         match next_event(&mut worker) {
-            Event::Failed { path, error: GitError::NotARepository { .. } } => assert_eq!(path, dir.path()),
+            Event::OpenFailed { path, error: GitError::NotARepository { .. } } => assert_eq!(path, dir.path()),
             other => panic!("unexpected event: {other:?}"),
         }
     }
@@ -194,6 +207,34 @@ mod tests {
             })
             .collect();
         assert_eq!(counts, [1, 2]);
+    }
+
+    #[test]
+    fn reloads_the_log_for_one_branch() {
+        let repo = TestRepo::with_commits(&["Base"]);
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.git(&["commit", "-q", "--allow-empty", "-m", "Feature work"]);
+        repo.git(&["checkout", "-q", "main"]);
+        let mut worker = worker();
+        worker.send(Job::Open(repo.path().to_path_buf()));
+        let Event::Opened { repo: opened, log, .. } = next_event(&mut worker) else {
+            panic!("expected Opened");
+        };
+        assert_eq!(log.commits.len(), 2, "all branches");
+
+        let scope = LogScope::Ref("refs/heads/main".into());
+        worker.send(Job::LoadLog { repo: opened.clone(), scope: scope.clone() });
+        match next_event(&mut worker) {
+            Event::LogLoaded { repo, scope: loaded, log } => {
+                assert_eq!(repo, opened);
+                assert_eq!(loaded, scope);
+                assert_eq!(log.commits.iter().map(|c| c.summary.as_str()).collect::<Vec<_>>(), ["Base"]);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        worker.send(Job::LoadLog { repo: opened, scope: LogScope::Ref("refs/heads/gone".into()) });
+        assert!(matches!(next_event(&mut worker), Event::LogFailed { .. }));
     }
 
     #[test]

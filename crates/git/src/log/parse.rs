@@ -3,6 +3,7 @@
 
 use super::Commit;
 use crate::error::{GitError, Result};
+use crate::hash::parse_hash;
 
 /// Fields per commit in `LOG_FORMAT`.
 const FIELDS: usize = 6;
@@ -55,13 +56,6 @@ fn parse_commit(index: usize, record: &[&[u8]; FIELDS]) -> Result<Commit> {
         author_email: String::from_utf8_lossy(email).into_owned(),
         summary: String::from_utf8_lossy(summary).into_owned(),
     })
-}
-
-/// A full commit hash: 40 (SHA-1) or 64 (SHA-256) lowercase hex digits.
-fn parse_hash(bytes: &[u8]) -> Option<String> {
-    let valid = matches!(bytes.len(), 40 | 64) && bytes.iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b));
-    // Only ASCII hex digits remain, so converting to a String can't fail.
-    if valid { String::from_utf8(bytes.to_vec()).ok() } else { None }
 }
 
 fn malformed(what: &str, detail: String) -> GitError {

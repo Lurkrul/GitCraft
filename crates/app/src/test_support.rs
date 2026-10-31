@@ -27,7 +27,7 @@ impl TestRepo {
     }
 
     /// Runs git with the user's own config shut out (it could require signed commits).
-    fn git(&self, args: &[&str]) {
+    pub fn git(&self, args: &[&str]) {
         let output = Command::new("git")
             .args(["-c", "user.name=Test Author", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false"])
             .args(args)

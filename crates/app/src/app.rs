@@ -7,7 +7,7 @@ use std::time::Instant;
 use craft_dialogs::{Answer, Dialogs, FileDialog};
 use craft_menu::MenuBar;
 use craft_settings::{SaveStatus, SettingsStore};
-use gitcraft_git::{DEFAULT_LOG_LIMIT, Log, Repo};
+use gitcraft_git::{DEFAULT_LOG_LIMIT, Log, LogScope, Refs, Repo};
 
 use crate::commands::Command;
 use crate::settings::Prefs;
@@ -30,7 +30,12 @@ enum DialogPurpose {
 /// The repository on screen and its history.
 struct OpenRepo {
     repo: Repo,
+    refs: Refs,
     log: Log,
+    /// The branch chosen in the dropdown. Can be ahead of `log_scope` while its history loads.
+    selected_scope: LogScope,
+    /// The scope `log` was read with.
+    log_scope: LogScope,
 }
 
 /// All of the app's state. eframe owns it and calls `logic` and `ui` on it every frame.
@@ -124,7 +129,23 @@ impl GitCraftApp {
 
     /// Starts opening `path` in the background.
     fn open_folder(&mut self, path: PathBuf) {
-        let sent = self.worker.as_mut().is_some_and(|worker| worker.send(Job::Open(path)));
+        self.send(Job::Open(path));
+    }
+
+    /// Shows the open repository's history for `scope` (loaded in the background; the current
+    /// history stays on screen until it arrives).
+    fn select_scope(&mut self, scope: LogScope) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        open.selected_scope = scope.clone();
+        let job = Job::LoadLog { repo: open.repo.clone(), scope };
+        self.send(job);
+    }
+
+    /// Hands a job to the background worker, reporting it if the worker has stopped.
+    fn send(&mut self, job: Job) {
+        let sent = self.worker.as_mut().is_some_and(|worker| worker.send(job));
         if !sent {
             self.worker = None;
             self.error = Some(WORKER_STOPPED.to_string());
@@ -148,22 +169,46 @@ impl GitCraftApp {
 
     /// Takes in whatever the background worker has finished.
     fn handle_worker_events(&mut self) {
-        let Some(worker) = self.worker.as_mut() else {
-            return;
+        // Take the events out first: `worker` borrows `self.worker`, and that borrow has to end
+        // before `handle_event` can borrow all of `self`.
+        let (events, alive) = match self.worker.as_mut() {
+            Some(worker) => (worker.poll(), worker.is_alive()),
+            None => return,
         };
-        for event in worker.poll() {
-            match event {
-                Event::Opened { repo, log } => {
-                    self.open = Some(OpenRepo { repo, log });
-                    self.error = None;
-                }
-                // The repository already on screen (if any) stays; the error explains what happened.
-                Event::Failed { path, error } => self.error = Some(open_failure_message(&path, &error)),
-            }
+        for event in events {
+            self.handle_event(event);
         }
-        if !worker.is_alive() {
+        if !alive {
             self.worker = None;
             self.error = Some(WORKER_STOPPED.to_string());
+        }
+    }
+
+    fn handle_event(&mut self, event: Event) {
+        match event {
+            Event::Opened { repo, refs, log } => {
+                let scope = LogScope::AllBranches;
+                self.open = Some(OpenRepo { repo, refs, log, selected_scope: scope.clone(), log_scope: scope });
+                self.error = None;
+            }
+            // The repository already on screen (if any) stays; the error explains what happened.
+            Event::OpenFailed { path, error } => self.error = Some(open_failure_message(&path, &error)),
+            Event::LogLoaded { repo, scope, log } => {
+                // Only if it is still what the user wants to see: they may have opened another
+                // repository or picked another branch while this one loaded.
+                if let Some(open) = self.open.as_mut().filter(|open| open.repo == repo && open.selected_scope == scope) {
+                    open.log = log;
+                    open.log_scope = scope;
+                    self.error = None;
+                }
+            }
+            Event::LogFailed { repo, scope, error } => {
+                if let Some(open) = self.open.as_mut().filter(|open| open.repo == repo && open.selected_scope == scope) {
+                    // Put the dropdown back to what the list still shows.
+                    open.selected_scope = open.log_scope.clone();
+                    self.error = Some(format!("Could not read the history of {}: {error}", repository::scope_label(&scope)));
+                }
+            }
         }
     }
 
@@ -273,7 +318,14 @@ impl GitCraftApp {
         }
         egui::Panel::top("tabs").show(ui, |ui| tabs::show(ui, &mut self.tab));
         if let (MainTab::Repository, Some(open)) = (self.tab, &self.open) {
-            egui::Panel::top("repository_toolbar").show(ui, |ui| repository::toolbar(ui, open.repo.root()));
+            let picked = egui::Panel::top("repository_toolbar")
+                .show(ui, |ui| repository::toolbar(ui, open.repo.root(), &open.refs, &open.selected_scope))
+                .inner;
+            // Acted on after the panel closure ends, when `open` (a borrow of `self.open`) is no
+            // longer in use and `self` can be changed.
+            if let Some(scope) = picked {
+                self.select_scope(scope);
+            }
         }
         let status = self.status_line();
         egui::Panel::bottom("status_bar").show(ui, |ui| status_bar::show(ui, &status));
@@ -467,6 +519,93 @@ mod tests {
         open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
         let root = app.open.as_ref().map(|open| open.repo.root().display().to_string()).unwrap();
         assert_eq!(app.window_title, format!("GitCraft — {root}"));
+    }
+
+    /// Runs frames until the background worker has nothing left to do.
+    fn settle(app: &mut GitCraftApp, ctx: &egui::Context) {
+        wait_until(|| {
+            run_frame(app, ctx, egui::RawInput::default());
+            !app.is_busy()
+        });
+    }
+
+    /// `main` has Base; `feature` has Base and Feature work.
+    fn repo_with_feature_branch() -> TestRepo {
+        let repo = TestRepo::with_commits(&["Base"]);
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.git(&["commit", "-q", "--allow-empty", "-m", "Feature work"]);
+        repo.git(&["checkout", "-q", "main"]);
+        repo
+    }
+
+    fn summaries(app: &GitCraftApp) -> Vec<String> {
+        app.open.as_ref().map(|open| open.log.commits.iter().map(|c| c.summary.clone()).collect()).unwrap_or_default()
+    }
+
+    #[test]
+    fn picking_a_branch_shows_only_its_history() {
+        let repo = repo_with_feature_branch();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        assert_eq!(summaries(&app).len(), 2, "all branches at first");
+
+        app.select_scope(LogScope::Ref("refs/heads/main".into()));
+        settle(&mut app, &ctx);
+        assert_eq!(summaries(&app), ["Base"]);
+
+        app.select_scope(LogScope::AllBranches);
+        settle(&mut app, &ctx);
+        assert_eq!(summaries(&app).len(), 2);
+    }
+
+    #[test]
+    fn a_result_for_a_branch_no_longer_selected_is_ignored() {
+        let repo = repo_with_feature_branch();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+
+        // Pick main, then change your mind before its history arrives.
+        app.select_scope(LogScope::Ref("refs/heads/main".into()));
+        app.select_scope(LogScope::Ref("refs/heads/feature".into()));
+        settle(&mut app, &ctx);
+        assert_eq!(summaries(&app), ["Feature work", "Base"]);
+        let open = app.open.as_ref().unwrap();
+        assert_eq!(open.log_scope, open.selected_scope);
+    }
+
+    #[test]
+    fn a_failed_branch_load_puts_the_dropdown_back() {
+        let repo = repo_with_feature_branch();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+
+        // The branch disappears after the list was read (deleted in another tool, say).
+        repo.git(&["branch", "-D", "feature"]);
+        app.select_scope(LogScope::Ref("refs/heads/feature".into()));
+        settle(&mut app, &ctx);
+
+        let open = app.open.as_ref().unwrap();
+        assert_eq!(open.selected_scope, LogScope::AllBranches);
+        assert_eq!(summaries(&app).len(), 2, "the old history stays");
+        match app.status_line() {
+            StatusLine::Error(text) => assert!(text.contains("history of feature"), "{text}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opening_reads_the_branches() {
+        let repo = repo_with_feature_branch();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        let open = app.open.as_ref().unwrap();
+        let names: Vec<_> = open.refs.branches().map(|r| r.short_name().to_string()).collect();
+        assert_eq!(names, ["feature", "main"]);
+        assert_eq!(open.refs.head_branch(), Some("refs/heads/main"));
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! # fn main() -> Result<(), gitcraft_git::GitError> {
 //! let git = gitcraft_git::Git::locate()?;
 //! let repo = git.open_repo(std::path::Path::new("."))?;
-//! let log = git.log(&repo, gitcraft_git::DEFAULT_LOG_LIMIT)?;
+//! let log = git.log(&repo, &gitcraft_git::LogScope::AllBranches, gitcraft_git::DEFAULT_LOG_LIMIT)?;
 //! for commit in &log.commits {
 //!     println!("{} {}", commit.short_id(), commit.summary);
 //! }
@@ -18,13 +18,16 @@
 
 mod command;
 mod error;
+mod hash;
 mod locate;
 mod log;
 mod platform;
+mod refs;
 mod repo;
 
 pub use command::RunOptions;
 pub use error::{GitError, Result};
 pub use locate::Git;
-pub use log::{Commit, DEFAULT_LOG_LIMIT, Log};
+pub use log::{Commit, DEFAULT_LOG_LIMIT, Log, LogScope};
+pub use refs::{Head, Ref, RefKind, Refs};
 pub use repo::Repo;

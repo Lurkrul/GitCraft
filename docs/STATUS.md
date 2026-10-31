@@ -62,8 +62,8 @@ repository name (full path on hover and in the window title).
 |---|---|---|
 | R1 | Commit step 3 | done (`f22430c`) |
 | R2 | Window shell: menu bar (craft-menu), tabs (craft-ui), repository toolbar | done |
-| R3 | Refs + branch dropdown filtering the history | next |
-| R4 | Lane assignment (pure, tested), graph drawing, ref labels, initials avatars | |
+| R3 | Refs + branch dropdown filtering the history | done |
+| R4 | Lane assignment (pure, tested), graph drawing, ref labels, initials avatars | next |
 | R5 | Two panes (craft-ui split), commit selection, details panel | |
 | R6 | Diff parsing and diff view | |
 | R7 | Reopen last repository; remember divider and branch per repository | |
@@ -75,6 +75,21 @@ R2 details:
 - Window title: "GitCraft — <path>" while a repository is open.
 - Shortcuts wait while a menu, dialog or the About window is open.
 - Verified on Windows: Ctrl+O, the File and Help menus, About and Close, Exit, and tab switching.
+
+R3 details:
+- Git layer: `refs()` (branches, remote branches, tags with annotated tags peeled, HEAD:
+  branch/unborn/detached; `origin/HEAD` symrefs skipped), and `log(repo, scope, limit)` with
+  `LogScope::AllBranches` (branches, remotes, tags and HEAD, `--date-order`) or `LogScope::Ref`.
+  Ref names are validated (must start with `refs/`, no control characters) before reaching git.
+- Dropdown: All branches, then Local (current branch marked), then Remote. Choosing one reloads the
+  history in the background. Late results for a branch or repository the user has left are
+  ignored. A failed load (branch deleted meanwhile) puts the dropdown back and shows the error.
+- Opening a repository now shows all branches (it used to show only HEAD's history).
+- Commit tab added as the first tab (placeholder until Milestone 3); the app starts on Repository.
+
+## Open questions
+
+- Submodules (Milestone 3): proposed design given to the user on 2026-10-31, awaiting a decision.
 
 ## To verify on Fedora (deferred; batched for later)
 

@@ -2,7 +2,7 @@
 
 mod parse;
 
-use crate::error::{GitError, Result};
+use crate::error::Result;
 use crate::locate::Git;
 use crate::repo::Repo;
 
@@ -51,32 +51,49 @@ pub struct Log {
     pub truncated: bool,
 }
 
+/// Which history [`Git::log`] reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum LogScope {
+    /// Every local branch, remote branch and tag, plus HEAD (which may be detached).
+    #[default]
+    AllBranches,
+    /// One ref, by its full name (`refs/heads/main`, `refs/remotes/origin/main`).
+    Ref(String),
+}
+
 impl Git {
-    /// Reads up to `limit` commits reachable from `HEAD`, newest first. A repository without
-    /// any commits gives an empty log, not an error.
-    pub fn log(&self, repo: &Repo, limit: usize) -> Result<Log> {
-        if !self.has_commits(repo)? {
-            return Ok(Log::default());
-        }
+    /// Reads up to `limit` commits in `scope`, newest first. Children always come before their
+    /// parents (`--date-order`), which the commit graph relies on. A repository without any
+    /// commits gives an empty log, not an error.
+    pub fn log(&self, repo: &Repo, scope: &LogScope, limit: usize) -> Result<Log> {
         // Ask for one more than the limit to learn whether there are more.
         let max_count = format!("--max-count={}", limit.saturating_add(1));
         // `--encoding=UTF-8` overrides any `i18n.logOutputEncoding` in the repository's config.
-        // The final `--` makes git read `HEAD` as a revision even if a file is called "HEAD".
-        let output = self.run(repo.root(), &["log", "-z", "--encoding=UTF-8", &max_count, LOG_FORMAT, "HEAD", "--"])?;
+        let mut args: Vec<&str> = vec!["log", "-z", "--encoding=UTF-8", "--date-order", &max_count, LOG_FORMAT];
+        let ref_name;
+        match scope {
+            LogScope::AllBranches => {
+                args.extend(["--branches", "--remotes", "--tags"]);
+                // HEAD too, so a detached HEAD's commits show; but only once it has a commit,
+                // because in a new repository `HEAD` names nothing and git would fail.
+                if self.head_commit(repo)?.is_some() {
+                    args.push("HEAD");
+                }
+            }
+            LogScope::Ref(name) => {
+                // A full ref name (starting with "refs/") can never be taken for an option.
+                ref_name = crate::refs::parse_ref_name(name.as_bytes())?;
+                args.push(&ref_name);
+            }
+        }
+        // The final `--` makes git read the revisions as revisions even if files share their names.
+        args.push("--");
+
+        let output = self.run(repo.root(), &args)?;
         let mut commits = parse::parse_log(&output)?;
         let truncated = commits.len() > limit;
         commits.truncate(limit);
         Ok(Log { commits, truncated })
-    }
-
-    /// Whether `HEAD` points at a commit. In a fresh repository it names a branch that doesn't
-    /// exist yet, and `rev-parse --verify --quiet` exits with code 1 without printing anything.
-    fn has_commits(&self, repo: &Repo) -> Result<bool> {
-        match self.run(repo.root(), &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]) {
-            Ok(_) => Ok(true),
-            Err(GitError::CommandFailed { code: Some(1), .. }) => Ok(false),
-            Err(err) => Err(err),
-        }
     }
 }
 
