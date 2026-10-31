@@ -10,6 +10,8 @@ const DIVIDER: f32 = 6.0;
 pub const DEFAULT_HISTORY_RATIO: f32 = 0.55;
 /// Details above the diff: the details' share of the height to start with.
 pub const DEFAULT_DETAILS_RATIO: f32 = 0.4;
+/// Commit tab: the changed-files list's share of the width to start with.
+pub const DEFAULT_CHANGES_RATIO: f32 = 0.3;
 
 /// How a split is laid out.
 pub struct Split<'a> {

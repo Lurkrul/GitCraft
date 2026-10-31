@@ -52,7 +52,7 @@ impl WindowPrefs {
     }
 }
 
-/// The Repository tab's dividers and the details panel's "More info" choice.
+/// The dividers of the Repository and Commit tabs, and the details panel's "More info" choice.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct LayoutPrefs {
@@ -61,6 +61,8 @@ pub struct LayoutPrefs {
     /// The details' share of the right pane's height.
     pub details_ratio: f64,
     pub details_expanded: bool,
+    /// The Commit tab's changed-files list's share of the width.
+    pub changes_ratio: f64,
 }
 
 impl Default for LayoutPrefs {
@@ -78,6 +80,7 @@ impl From<&RepoLayout> for LayoutPrefs {
             history_ratio: round(layout.history_ratio),
             details_ratio: round(layout.details_ratio),
             details_expanded: layout.details_expanded,
+            changes_ratio: round(layout.changes_ratio),
         }
     }
 }
@@ -90,6 +93,7 @@ impl LayoutPrefs {
             history_ratio: split::sane_ratio(self.history_ratio as f32),
             details_ratio: split::sane_ratio(self.details_ratio as f32),
             details_expanded: self.details_expanded,
+            changes_ratio: split::sane_ratio(self.changes_ratio as f32),
         }
     }
 }
@@ -270,24 +274,25 @@ mod tests {
 
     #[test]
     fn saved_ratios_are_rounded() {
-        let layout = RepoLayout { history_ratio: 0.4, details_ratio: 0.123_456, details_expanded: false };
+        let layout = RepoLayout { history_ratio: 0.4, details_ratio: 0.123_456, details_expanded: false, changes_ratio: 0.3 };
         let prefs = LayoutPrefs::from(&layout);
         assert_eq!((prefs.history_ratio, prefs.details_ratio), (0.4, 0.123));
     }
 
     #[test]
     fn damaged_ratios_are_made_sane() {
-        let prefs = LayoutPrefs { history_ratio: f64::NAN, details_ratio: 40.0, details_expanded: true };
+        let prefs = LayoutPrefs { history_ratio: f64::NAN, details_ratio: 40.0, details_expanded: true, changes_ratio: -1.0 };
         let layout = prefs.to_layout();
         assert_eq!(layout.history_ratio, 0.5);
         assert_eq!(layout.details_ratio, 0.9);
         assert!(layout.details_expanded);
+        assert_eq!(layout.changes_ratio, 0.1);
     }
 
     #[test]
     fn layout_and_repositories_survive_a_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let layout = LayoutPrefs { history_ratio: 0.3, details_ratio: 0.6, details_expanded: true };
+        let layout = LayoutPrefs { history_ratio: 0.3, details_ratio: 0.6, details_expanded: true, changes_ratio: 0.2 };
         {
             let (mut store, _) = SettingsStore::<Prefs>::open_at(dir.path());
             store.update(|p| {

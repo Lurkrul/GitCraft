@@ -4,6 +4,7 @@ use chrono::Local;
 use gitcraft_git::{ChangedFile, CommitDetails, FileStatus};
 
 use crate::graph::avatar;
+use crate::ui::file_row;
 use crate::ui::time::format_time;
 
 /// What the panel has to show.
@@ -201,46 +202,18 @@ fn files(ui: &mut egui::Ui, details: &CommitDetails, selected_file: Option<&str>
     ui.add_space(4.0);
     let mut clicked = None;
     for (index, file) in details.files.iter().enumerate() {
-        // A placeholder shape, filled in once we know the row's size and whether it is hovered.
-        // (Painting the highlight after the row would cover its text.)
-        let background = ui.painter().add(egui::Shape::Noop);
-        let row = ui
-            .horizontal(|ui| {
-                let (letter_color, tooltip) = status_style(ui, file.status);
-                // Labels are not selectable here, so a click selects the file instead of text.
-                ui.add(
-                    egui::Label::new(egui::RichText::new(file.status.letter().to_string()).monospace().strong().color(letter_color))
-                        .selectable(false),
-                )
-                .on_hover_text(tooltip);
-                let path = ui.add(egui::Label::new(&file.path).truncate().selectable(false));
-                if let Some(old) = &file.old_path {
-                    path.on_hover_text(format!("from {old}"));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match file.lines {
-                    Some((added, removed)) => {
-                        ui.add(egui::Label::new(egui::RichText::new(format!("-{removed}")).color(removed_color(ui))).selectable(false));
-                        ui.add(egui::Label::new(egui::RichText::new(format!("+{added}")).color(added_color(ui))).selectable(false));
-                    }
-                    None => {
-                        ui.add(egui::Label::new(egui::RichText::new("binary").weak()).selectable(false));
-                    }
-                });
-            })
-            .response;
-        let response =
-            ui.interact(row.rect, ui.scope_id().with(("changed-file", index)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let (color, tooltip) = status_style(ui, file.status);
+        let letter = file_row::Letter { letter: file.status.letter(), color, tooltip };
         let is_selected = selected_file == Some(file.path.as_str());
-        let fill = if is_selected {
-            Some(ui.visuals().selection.bg_fill)
-        } else if response.hovered() {
-            Some(ui.visuals().widgets.hovered.weak_bg_fill)
-        } else {
-            None
-        };
-        if let Some(fill) = fill {
-            ui.painter().set(background, egui::epaint::RectShape::filled(row.rect.expand(1.0), 2.0, fill));
-        }
+        let path_tooltip = file.old_path.as_ref().map(|old| format!("from {old}"));
+        let response = file_row::show(ui, ("changed-file", index), &letter, &file.path, path_tooltip, is_selected, |ui| match file.lines {
+            Some((added, removed)) => {
+                let (added_color, removed_color) = (file_row::added_color(ui), file_row::removed_color(ui));
+                file_row::plain(ui, egui::RichText::new(format!("-{removed}")).color(removed_color));
+                file_row::plain(ui, egui::RichText::new(format!("+{added}")).color(added_color));
+            }
+            None => file_row::plain(ui, egui::RichText::new("binary").weak()),
+        });
         if response.clicked() && !is_selected {
             clicked = Some(file.path.clone());
         }
@@ -248,21 +221,13 @@ fn files(ui: &mut egui::Ui, details: &CommitDetails, selected_file: Option<&str>
     clicked
 }
 
-fn added_color(ui: &egui::Ui) -> egui::Color32 {
-    if ui.visuals().dark_mode { egui::Color32::from_rgb(0x81, 0xc7, 0x84) } else { egui::Color32::from_rgb(0x2e, 0x7d, 0x32) }
-}
-
-fn removed_color(ui: &egui::Ui) -> egui::Color32 {
-    if ui.visuals().dark_mode { egui::Color32::from_rgb(0xe5, 0x73, 0x73) } else { egui::Color32::from_rgb(0xc6, 0x28, 0x28) }
-}
-
 fn status_style(ui: &egui::Ui, status: FileStatus) -> (egui::Color32, &'static str) {
     match status {
-        FileStatus::Added => (added_color(ui), "Added"),
-        FileStatus::Deleted => (removed_color(ui), "Deleted"),
-        FileStatus::Modified => (egui::Color32::from_rgb(0xff, 0xb7, 0x4d), "Modified"),
-        FileStatus::Renamed => (egui::Color32::from_rgb(0x4f, 0xc3, 0xf7), "Renamed"),
-        FileStatus::Copied => (egui::Color32::from_rgb(0x4f, 0xc3, 0xf7), "Copied"),
+        FileStatus::Added => (file_row::added_color(ui), "Added"),
+        FileStatus::Deleted => (file_row::removed_color(ui), "Deleted"),
+        FileStatus::Modified => (file_row::MODIFIED_COLOR, "Modified"),
+        FileStatus::Renamed => (file_row::RENAMED_COLOR, "Renamed"),
+        FileStatus::Copied => (file_row::RENAMED_COLOR, "Copied"),
         FileStatus::TypeChanged => (ui.visuals().text_color(), "Type changed"),
         FileStatus::Other => (ui.visuals().weak_text_color(), "Other change"),
     }

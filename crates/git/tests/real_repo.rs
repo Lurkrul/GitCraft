@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use gitcraft_git::{DiffRequest, FileStatus, Git, GitError, Head, LineKind, LogScope, RefKind};
+use gitcraft_git::{DiffRequest, EntryKind, FileStatus, Git, GitError, Head, LineKind, LogScope, RefKind, WorkingChange, WorkingDiffRequest};
 
 /// A throwaway repository. Both folders are deleted when this is dropped.
 struct TestRepo {
@@ -450,4 +450,137 @@ fn file_diffs_need_full_hashes() {
     let opened = git.open_repo(repo.path()).unwrap();
     assert!(matches!(git.file_diff(&opened, &diff_request("HEAD", None, "x", None)), Err(GitError::Malformed { .. })));
     assert!(matches!(git.file_diff(&opened, &diff_request(&root, Some("--cached"), "x", None)), Err(GitError::Malformed { .. })));
+}
+
+fn write(repo: &TestRepo, path: &str, contents: &str) {
+    let full = repo.path().join(path);
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(full, contents).unwrap();
+}
+
+#[test]
+fn status_lists_staged_unstaged_and_untracked_files() {
+    let repo = TestRepo::new();
+    for name in ["edited.txt", "staged.txt", "gone.txt"] {
+        write(&repo, name, "original\n");
+    }
+    repo.git(&["add", "."]);
+    repo.commit("Root");
+
+    write(&repo, "edited.txt", "changed\n");
+    write(&repo, "staged.txt", "changed\n");
+    repo.git(&["add", "staged.txt"]);
+    std::fs::remove_file(repo.path().join("gone.txt")).unwrap();
+    write(&repo, "added.txt", "new\n");
+    repo.git(&["add", "added.txt"]);
+    write(&repo, "new folder/untracked file.txt", "new\n");
+
+    let git = git();
+    let status = git.status(&git.open_repo(repo.path()).unwrap()).unwrap();
+    let mut summary: Vec<_> = status.entries.iter().map(|e| (e.path.as_str(), e.change(), e.has_staged())).collect();
+    summary.sort_by(|a, b| a.0.cmp(b.0));
+    assert_eq!(
+        summary,
+        [
+            ("added.txt", WorkingChange::Added, true),
+            ("edited.txt", WorkingChange::Modified, false),
+            ("gone.txt", WorkingChange::Deleted, false),
+            ("new folder/untracked file.txt", WorkingChange::Added, false),
+            ("staged.txt", WorkingChange::Modified, true),
+        ]
+    );
+    let untracked = status.entries.iter().find(|e| e.path.starts_with("new folder")).unwrap();
+    assert_eq!(untracked.kind, EntryKind::Untracked);
+}
+
+#[test]
+fn a_clean_tree_has_no_changes() {
+    let repo = TestRepo::new();
+    write(&repo, "a.txt", "a\n");
+    repo.git(&["add", "."]);
+    repo.commit("Root");
+    let git = git();
+    let status = git.status(&git.open_repo(repo.path()).unwrap()).unwrap();
+    assert!(status.entries.is_empty() && !status.truncated);
+}
+
+fn working(path: &str, new_file: bool) -> WorkingDiffRequest {
+    WorkingDiffRequest { path: path.into(), new_file }
+}
+
+fn changed_lines(diff: &gitcraft_git::FileDiff) -> Vec<(LineKind, String)> {
+    diff.hunks.iter().flat_map(|h| &h.lines).filter(|l| l.kind != LineKind::Context).map(|l| (l.kind, l.text.clone())).collect()
+}
+
+#[test]
+fn working_diffs_show_staged_and_unstaged_changes_together() {
+    let repo = TestRepo::new();
+    write(&repo, "notes.txt", "one\ntwo\nthree\n");
+    write(&repo, "gone.txt", "bye\n");
+    repo.git(&["add", "."]);
+    repo.commit("Root");
+
+    // One change staged, a second one not: both show, compared with HEAD.
+    write(&repo, "notes.txt", "ONE\ntwo\nthree\n");
+    repo.git(&["add", "notes.txt"]);
+    write(&repo, "notes.txt", "ONE\ntwo\nTHREE\n");
+    std::fs::remove_file(repo.path().join("gone.txt")).unwrap();
+    write(&repo, "brand new.txt", "hello\nworld\n");
+
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    let diff = git.working_diff(&opened, &working("notes.txt", false)).unwrap();
+    let expected = [(LineKind::Removed, "one"), (LineKind::Added, "ONE"), (LineKind::Removed, "three"), (LineKind::Added, "THREE")];
+    assert_eq!(changed_lines(&diff), expected.map(|(k, t)| (k, t.to_string())));
+
+    let diff = git.working_diff(&opened, &working("gone.txt", false)).unwrap();
+    assert_eq!(changed_lines(&diff), [(LineKind::Removed, "bye".to_string())]);
+
+    let diff = git.working_diff(&opened, &working("brand new.txt", true)).unwrap();
+    assert_eq!(changed_lines(&diff), [(LineKind::Added, "hello".to_string()), (LineKind::Added, "world".to_string())]);
+    assert_eq!(diff.hunks[0].lines[0].new_line, Some(1));
+}
+
+#[test]
+fn working_diffs_work_before_the_first_commit() {
+    let repo = TestRepo::new();
+    write(&repo, "first.txt", "a\n");
+    repo.git(&["add", "first.txt"]);
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    let status = git.status(&opened).unwrap();
+    assert_eq!(status.entries.len(), 1);
+    assert!(status.entries[0].is_new());
+    let diff = git.working_diff(&opened, &working("first.txt", true)).unwrap();
+    assert_eq!(changed_lines(&diff), [(LineKind::Added, "a".to_string())]);
+}
+
+#[test]
+fn a_new_file_that_has_gone_has_no_diff() {
+    let repo = TestRepo::new();
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    let diff = git.working_diff(&opened, &working("never-existed.txt", true)).unwrap();
+    assert!(diff.hunks.is_empty());
+}
+
+#[test]
+fn working_diff_paths_are_literal_and_stay_inside() {
+    let repo = TestRepo::new();
+    write(&repo, "weird[1].txt", "a\n");
+    write(&repo, "weird1.txt", "decoy\n");
+    repo.git(&["add", "."]);
+    repo.commit("Root");
+    write(&repo, "weird[1].txt", "b\n");
+    write(&repo, "weird1.txt", "decoy changed\n");
+
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    let diff = git.working_diff(&opened, &working("weird[1].txt", false)).unwrap();
+    assert_eq!(changed_lines(&diff), [(LineKind::Removed, "a".to_string()), (LineKind::Added, "b".to_string())]);
+
+    let escape = git.working_diff(&opened, &working("../outside.txt", true));
+    assert!(matches!(escape, Err(GitError::Malformed { .. })), "{escape:?}");
 }

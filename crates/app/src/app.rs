@@ -7,11 +7,12 @@ use std::time::Instant;
 use craft_dialogs::{Answer, Dialogs, FileDialog};
 use craft_menu::MenuBar;
 use craft_settings::{SaveStatus, SettingsStore};
-use gitcraft_git::{DEFAULT_LOG_LIMIT, DiffRequest, LogScope, Refs, Repo};
+use gitcraft_git::{DEFAULT_LOG_LIMIT, DiffRequest, Head, LogScope, Refs, Repo, WorkingDiffRequest};
 
 use crate::commands::Command;
 use crate::graph::History;
 use crate::settings::{LayoutPrefs, Prefs};
+use crate::ui::commit_tab::{self, Changes};
 use crate::ui::details::DetailsState;
 use crate::ui::diff_view::{self, DiffState, DiffView};
 use crate::ui::ref_labels::{self, LabelMap};
@@ -32,6 +33,13 @@ enum DialogPurpose {
     OpenRepository,
 }
 
+/// Something the user picked in the main area this frame, acted on once drawing is done.
+enum Picked {
+    Repository(repository::Pick),
+    /// A changed file in the Commit tab.
+    WorkingFile(String),
+}
+
 /// The repository on screen and its history.
 struct OpenRepo {
     repo: Repo,
@@ -50,6 +58,13 @@ struct OpenRepo {
     /// The selected file of that commit, and its diff.
     selected_file: Option<String>,
     diff: DiffState,
+    /// The working tree's changes, for the Commit tab.
+    changes: Changes,
+    /// A `git status` is on its way.
+    status_loading: bool,
+    /// Another refresh was asked for while one was on its way: run it when that one arrives
+    /// (so files changed meanwhile aren't missed, and refreshes never pile up).
+    status_again: bool,
 }
 
 impl OpenRepo {
@@ -67,6 +82,9 @@ impl OpenRepo {
             details: DetailsState::Empty,
             selected_file: None,
             diff: DiffState::Empty,
+            changes: Changes::default(),
+            status_loading: false,
+            status_again: false,
         }
     }
 
@@ -261,6 +279,51 @@ impl GitCraftApp {
                 if let Some(name) = saved.filter(|_| restore) {
                     self.select_scope(LogScope::Ref(name));
                 }
+                self.refresh_status();
+            }
+            Event::StatusLoaded { repo, result } => {
+                let Some(open) = self.open.as_mut().filter(|open| open.repo == repo) else {
+                    return;
+                };
+                open.status_loading = false;
+                match result {
+                    Ok(status) => {
+                        // Keep the selected file if it is still changed; otherwise pick the first.
+                        let keep = open.changes.selected.as_deref().filter(|path| status.entries.iter().any(|entry| entry.path == *path));
+                        let selected = keep.map(str::to_string).or_else(|| status.entries.first().map(|entry| entry.path.clone()));
+                        open.changes.status = Some(status);
+                        open.changes.error = None;
+                        match selected {
+                            // Read again even if it was already shown: the file may have changed.
+                            Some(path) => self.select_working_file(path),
+                            None => {
+                                open.changes.selected = None;
+                                open.changes.diff = DiffState::Empty;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        // The list on screen (if any) stays; the message says why it didn't update.
+                        let message = format!("Could not read the working tree's changes: {error}");
+                        open.changes.error = Some(message.clone());
+                        self.error = Some(message);
+                    }
+                }
+                let again = self.open.as_mut().is_some_and(|open| std::mem::take(&mut open.status_again));
+                if again {
+                    self.refresh_status();
+                }
+            }
+            Event::WorkingDiffLoaded { repo, request, result } => {
+                // Only for the file still selected.
+                if let Some(open) =
+                    self.open.as_mut().filter(|open| open.repo == repo && open.changes.selected.as_deref() == Some(request.path.as_str()))
+                {
+                    open.changes.diff = match result {
+                        Ok(diff) => DiffState::Loaded(Box::new(DiffView::new(diff))),
+                        Err(error) => DiffState::Failed(diff_view::failure_message(&error)),
+                    };
+                }
             }
             // The repository already on screen (if any) stays; the error explains what happened.
             Event::OpenFailed { path, error } => self.error = Some(open_failure_message(&path, &error)),
@@ -377,6 +440,7 @@ impl GitCraftApp {
         self.remember_window(ctx);
         self.handle_shortcuts(ctx);
         self.handle_arrow_keys(ctx);
+        self.handle_refresh_keys(ctx);
         self.handle_dialog_answers();
         self.handle_worker_events();
         self.sync_window_title(ctx);
@@ -433,7 +497,12 @@ impl GitCraftApp {
         for command in chosen {
             self.run(command);
         }
+        let tab_before = self.tab;
         egui::Panel::top("tabs").show(ui, |ui| tabs::show(ui, &mut self.tab));
+        if self.tab == MainTab::Commit && tab_before != MainTab::Commit {
+            // Files may have changed since the list was read.
+            self.refresh_status();
+        }
         if let (MainTab::Repository, Some(open)) = (self.tab, &self.open) {
             let picked = egui::Panel::top("repository_toolbar")
                 .show(ui, |ui| repository::toolbar(ui, open.repo.root(), &open.refs, &open.selected_scope))
@@ -460,14 +529,17 @@ impl GitCraftApp {
                         diff: &open.diff,
                         scroll_to,
                     };
-                    repository::body(ui, &view, &mut self.layout)
+                    repository::body(ui, &view, &mut self.layout).map(Picked::Repository)
                 }
                 (MainTab::Repository, None) => {
                     repository::welcome(ui);
                     None
                 }
-                (MainTab::Commit, _) => {
-                    placeholder::coming_later(ui, "Committing", 3);
+                (MainTab::Commit, Some(open)) => commit_tab::show(ui, &open.changes, &mut self.layout.changes_ratio).map(Picked::WorkingFile),
+                (MainTab::Commit, None) => {
+                    ui.centered_and_justified(|ui| {
+                        ui.weak("Open a repository to see its changes.");
+                    });
                     None
                 }
                 (MainTab::Issues, _) => {
@@ -481,9 +553,10 @@ impl GitCraftApp {
             })
             .inner;
         match pick {
-            Some(repository::Pick::Row(row)) => self.select_row(row),
-            Some(repository::Pick::File(path)) => self.select_file(path),
-            Some(repository::Pick::Commit(id)) => {
+            Some(Picked::Repository(repository::Pick::Row(row))) => self.select_row(row),
+            Some(Picked::Repository(repository::Pick::File(path))) => self.select_file(path),
+            Some(Picked::WorkingFile(path)) => self.select_working_file(path),
+            Some(Picked::Repository(repository::Pick::Commit(id))) => {
                 // A parent link: select it, and bring it into view if it is in the list.
                 self.select_commit(id);
                 self.scroll_to = self.open.as_ref().and_then(OpenRepo::selected_row);
@@ -546,6 +619,51 @@ impl GitCraftApp {
         open.diff = DiffState::Loading;
         let job = Job::LoadDiff { repo: open.repo.clone(), request };
         self.send(job);
+    }
+
+    /// Reads the working tree's changes again (in the background).
+    fn refresh_status(&mut self) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        if open.status_loading {
+            open.status_again = true;
+            return;
+        }
+        open.status_loading = true;
+        let job = Job::LoadStatus { repo: open.repo.clone() };
+        self.send(job);
+    }
+
+    /// Selects a changed file in the Commit tab and starts reading its diff.
+    fn select_working_file(&mut self, path: String) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let Some(entry) = open.changes.entry(&path) else {
+            return;
+        };
+        // Before the first commit there is no HEAD to compare with, so every file is new.
+        let new_file = entry.is_new() || matches!(open.refs.head, Head::Unborn { .. });
+        let request = WorkingDiffRequest { path: path.clone(), new_file };
+        // A different file shows a spinner; the same file (a refresh) keeps its diff on screen
+        // until the new one arrives, so it doesn't flicker.
+        if open.changes.selected.as_deref() != Some(path.as_str()) {
+            open.changes.diff = DiffState::Loading;
+        }
+        open.changes.selected = Some(path);
+        let job = Job::LoadWorkingDiff { repo: open.repo.clone(), request };
+        self.send(job);
+    }
+
+    /// The working tree is read again when the window gets focus back (files may have been
+    /// edited in another program) and when F5 is pressed.
+    fn handle_refresh_keys(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|input| input.events.iter().any(|event| matches!(event, egui::Event::WindowFocused(true))));
+        let f5 = ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F5));
+        if focused || f5 {
+            self.refresh_status();
+        }
     }
 
     /// ↑ and ↓ move the selection through the history while nothing else wants the keys.
@@ -981,7 +1099,12 @@ mod tests {
 
     /// The diff on screen as (kind, text) pairs, hunk headers left out.
     fn diff_lines(app: &GitCraftApp) -> Option<Vec<(gitcraft_git::LineKind, String)>> {
-        match &app.open.as_ref()?.diff {
+        lines_of(&app.open.as_ref()?.diff)
+    }
+
+    /// The +/- and context lines of a loaded diff.
+    fn lines_of(diff: &DiffState) -> Option<Vec<(gitcraft_git::LineKind, String)>> {
+        match diff {
             DiffState::Loaded(view) => Some(
                 view.rows
                     .iter()
@@ -1122,14 +1245,143 @@ mod tests {
 
     #[test]
     fn the_layout_is_restored_and_saved() {
-        let prefs = Prefs { layout: LayoutPrefs { history_ratio: 0.3, details_ratio: 0.7, details_expanded: false }, ..Prefs::default() };
+        let prefs = Prefs {
+            layout: LayoutPrefs { history_ratio: 0.3, details_ratio: 0.7, details_expanded: false, changes_ratio: 0.25 },
+            ..Prefs::default()
+        };
         let ctx = egui::Context::default();
         let mut app = app_with_prefs(&ctx, prefs);
-        assert_eq!(app.layout, RepoLayout { history_ratio: 0.3, details_ratio: 0.7, details_expanded: false });
+        assert_eq!(app.layout, RepoLayout { history_ratio: 0.3, details_ratio: 0.7, details_expanded: false, changes_ratio: 0.25 });
 
         app.layout.details_expanded = true; // as if "More info" were clicked
         run_frame(&mut app, &ctx, egui::RawInput::default());
         assert!(app.settings.get().layout.details_expanded);
+    }
+
+    /// Paths in the Commit tab's list.
+    fn changed_paths(app: &GitCraftApp) -> Vec<String> {
+        let status = app.open.as_ref().and_then(|open| open.changes.status.as_ref());
+        status.map(|status| status.entries.iter().map(|entry| entry.path.clone()).collect()).unwrap_or_default()
+    }
+
+    fn working_diff_lines(app: &GitCraftApp) -> Option<Vec<(gitcraft_git::LineKind, String)>> {
+        lines_of(&app.open.as_ref()?.changes.diff)
+    }
+
+    fn selected_change(app: &GitCraftApp) -> Option<String> {
+        app.open.as_ref()?.changes.selected.clone()
+    }
+
+    #[test]
+    fn the_commit_tab_lists_changes_and_shows_the_first_diff() {
+        use gitcraft_git::LineKind::{Added, Removed};
+        let repo = repo_with_file_changes();
+        std::fs::write(repo.path().join("a.txt"), "one\nTWO\n").unwrap();
+        std::fs::write(repo.path().join("c.txt"), "new\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.tab = MainTab::Commit;
+        settle(&mut app, &ctx);
+
+        assert_eq!(changed_paths(&app), ["a.txt", "c.txt"]);
+        assert_eq!(selected_change(&app).as_deref(), Some("a.txt"), "the first file is selected");
+        assert_eq!(
+            working_diff_lines(&app).unwrap().into_iter().filter(|(kind, _)| *kind != gitcraft_git::LineKind::Context).collect::<Vec<_>>(),
+            [(Removed, "two".to_string()), (Added, "TWO".to_string())]
+        );
+
+        app.select_working_file("c.txt".into());
+        settle(&mut app, &ctx);
+        assert_eq!(working_diff_lines(&app).unwrap(), [(Added, "new".to_string())], "an untracked file is all added");
+    }
+
+    #[test]
+    fn a_clean_tree_has_nothing_selected() {
+        let repo = repo_with_file_changes();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.tab = MainTab::Commit;
+        settle(&mut app, &ctx);
+        assert!(changed_paths(&app).is_empty());
+        assert_eq!(selected_change(&app), None);
+    }
+
+    /// Input for one frame in which the window gets the focus back.
+    fn focus_returns() -> egui::RawInput {
+        egui::RawInput { events: vec![egui::Event::WindowFocused(true)], ..Default::default() }
+    }
+
+    #[test]
+    fn focus_and_f5_read_the_changes_again() {
+        let repo = repo_with_file_changes();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        assert!(changed_paths(&app).is_empty());
+
+        // Edited in another program, then back to GitCraft.
+        std::fs::write(repo.path().join("edited elsewhere.txt"), "x\n").unwrap();
+        run_frame(&mut app, &ctx, focus_returns());
+        settle(&mut app, &ctx);
+        assert_eq!(changed_paths(&app), ["edited elsewhere.txt"]);
+
+        std::fs::write(repo.path().join("second.txt"), "y\n").unwrap();
+        run_frame(&mut app, &ctx, press(egui::Key::F5));
+        settle(&mut app, &ctx);
+        assert_eq!(changed_paths(&app), ["edited elsewhere.txt", "second.txt"]);
+        assert_eq!(selected_change(&app).as_deref(), Some("edited elsewhere.txt"), "the selection stays");
+    }
+
+    #[test]
+    fn refreshes_never_pile_up() {
+        let repo = repo_with_file_changes();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+
+        std::fs::write(repo.path().join("new.txt"), "x\n").unwrap();
+        for _ in 0..5 {
+            app.refresh_status();
+        }
+        let open = app.open.as_ref().unwrap();
+        assert!(open.status_loading && open.status_again, "one running, one queued");
+        settle(&mut app, &ctx);
+        let open = app.open.as_ref().unwrap();
+        assert!(!open.status_loading && !open.status_again);
+        assert_eq!(changed_paths(&app), ["new.txt"]);
+    }
+
+    #[test]
+    fn a_deleted_selected_file_moves_the_selection() {
+        let repo = repo_with_file_changes();
+        std::fs::write(repo.path().join("first.txt"), "1\n").unwrap();
+        std::fs::write(repo.path().join("second.txt"), "2\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        assert_eq!(selected_change(&app).as_deref(), Some("first.txt"));
+
+        std::fs::remove_file(repo.path().join("first.txt")).unwrap();
+        app.refresh_status();
+        settle(&mut app, &ctx);
+        assert_eq!(selected_change(&app).as_deref(), Some("second.txt"));
+        assert_eq!(working_diff_lines(&app).unwrap(), [(gitcraft_git::LineKind::Added, "2".to_string())]);
+    }
+
+    #[test]
+    fn changes_show_before_the_first_commit() {
+        let repo = TestRepo::with_commits(&[]);
+        std::fs::write(repo.path().join("first.txt"), "hello\n").unwrap();
+        repo.git(&["add", "first.txt"]);
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.tab = MainTab::Commit;
+        settle(&mut app, &ctx);
+        assert_eq!(changed_paths(&app), ["first.txt"]);
+        assert_eq!(working_diff_lines(&app).unwrap(), [(gitcraft_git::LineKind::Added, "hello".to_string())]);
     }
 
     #[test]

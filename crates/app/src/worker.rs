@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
-use gitcraft_git::{CommitDetails, DEFAULT_LOG_LIMIT, DiffRequest, FileDiff, Git, GitError, LogScope, Refs, Repo};
+use gitcraft_git::{CommitDetails, DEFAULT_LOG_LIMIT, DiffRequest, FileDiff, Git, GitError, LogScope, Refs, Repo, Status, WorkingDiffRequest};
 
 use crate::graph::History;
 
@@ -30,6 +30,10 @@ pub enum Job {
     LoadDetails { repo: Repo, id: String },
     /// Read one changed file's diff for the diff view.
     LoadDiff { repo: Repo, request: DiffRequest },
+    /// Read the working tree's changes for the Commit tab.
+    LoadStatus { repo: Repo },
+    /// Read one changed file's diff from HEAD to the working tree.
+    LoadWorkingDiff { repo: Repo, request: WorkingDiffRequest },
 }
 
 /// What the background thread reports back. Each [`Job`] produces exactly one event. Events say
@@ -43,6 +47,8 @@ pub enum Event {
     LogFailed { repo: Repo, scope: LogScope, error: GitError },
     DetailsLoaded { repo: Repo, id: String, result: Result<CommitDetails, GitError> },
     DiffLoaded { repo: Repo, request: DiffRequest, result: Result<FileDiff, GitError> },
+    StatusLoaded { repo: Repo, result: Result<Status, GitError> },
+    WorkingDiffLoaded { repo: Repo, request: WorkingDiffRequest, result: Result<FileDiff, GitError> },
 }
 
 /// The UI's handle on the background thread. Dropping it closes the job channel, which ends the
@@ -133,6 +139,14 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, wake: Wake) {
             Job::LoadDiff { repo, request } => {
                 let result = located(&mut git).and_then(|git| git.file_diff(&repo, &request));
                 Event::DiffLoaded { repo, request, result }
+            }
+            Job::LoadStatus { repo } => {
+                let result = located(&mut git).and_then(|git| git.status(&repo));
+                Event::StatusLoaded { repo, result }
+            }
+            Job::LoadWorkingDiff { repo, request } => {
+                let result = located(&mut git).and_then(|git| git.working_diff(&repo, &request));
+                Event::WorkingDiffLoaded { repo, request, result }
             }
         };
         if events.send(event).is_err() {

@@ -26,6 +26,7 @@ mod log;
 mod platform;
 mod refs;
 mod repo;
+mod status;
 
 pub use command::RunOptions;
 pub use details::{ChangedFile, CommitDetails, FileStatus};
@@ -35,3 +36,4 @@ pub use locate::Git;
 pub use log::{Commit, DEFAULT_LOG_LIMIT, Log, LogScope};
 pub use refs::{Head, Ref, RefKind, Refs};
 pub use repo::Repo;
+pub use status::{Change, EntryKind, MAX_STATUS_ENTRIES, Status, StatusEntry, WorkingChange, WorkingDiffRequest};

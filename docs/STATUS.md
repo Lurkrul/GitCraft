@@ -2,7 +2,7 @@
 
 Last updated: 2026-10-31
 
-## Milestones 1 and 2 are done. Next: Milestone 3, Git actions (needs a plan first)
+## Milestones 1 and 2 are done. Current: Milestone 3, Git actions (see below)
 
 Plan (approved 2026-10-31): a Cargo workspace (`crates/app`, `crates/git`); licence MIT OR
 Apache-2.0, matching craft-libs.
@@ -153,15 +153,63 @@ R7 details:
 - Verified on Windows with a hand-written config (forward slashes): the repository, branch and dividers
   were restored, and the file came back with a single entry.
 
+## Milestone 3: Git actions (plan approved 2026-10-31)
+
+Decisions: the Commit tab works like GitHub Desktop: every change starts ticked, and files, hunks or
+single lines can be unticked; Commit stages exactly what is ticked (`git add` for whole files,
+`git apply --cached` with a generated patch for partial ones) and then commits. Unticked changes stay
+in the working tree. If something is already staged when the tab first reads it (`git add` in a
+terminal), the ticks start out matching the index exactly. Pull follows the user's git config,
+exactly like the command line. Submodules as designed (G7).
+
+| Step | What | State |
+|---|---|---|
+| G1 | Commit tab: changed files (`git status`) and each file's diff from HEAD to the working tree | done |
+| G2 | File checkboxes, summary/description, Commit (Ctrl+Enter), Amend; hook output on failure | next |
+| G3 | Hunk and line checkboxes; pure patch builder for `git apply --cached` | |
+| G4 | Discard changes (file, hunk, lines) after a confirmation naming what is lost | |
+| G5 | Branches: new, checkout, rename, delete (with confirmations) | |
+| G6 | Repository menu: fetch, pull, push on a second worker; cancel; `--force-with-lease` only | |
+| G7 | Submodules: Repository → Submodules menu, list, open with breadcrumb, Commit tab entries | |
+
+G1 details:
+- Git layer: `status(repo)` runs `git status --porcelain=v2 -z --untracked-files=all --no-renames
+  --ignore-submodules=none`; a pure parser reads ordinary, rename, conflict and untracked records,
+  rejects paths that leave the repository (platform path rules) and stops at 50,000 entries.
+  `StatusEntry::change()` combines staged and unstaged into one HEAD-to-working-tree change;
+  `has_staged()` will seed the ticks in G2.
+- `working_diff(repo, request)`: `git diff HEAD -- path`, or, for a file not in HEAD (untracked,
+  newly added, or no commits yet), `git diff --no-index -- /dev/null path` (exit code 1 accepted
+  via the new `RunOptions::also_ok`). Same safety flags and limits as commit diffs.
+- Commit tab: the file list (status letter, path) and the selected file's diff, side by side with a
+  draggable divider (saved as `changes_ratio`). The first file is selected automatically.
+- Refreshes: when the repository opens, when the Commit tab is shown, when the window gets the focus
+  back, and on F5. A refresh asked for while one is running is queued once, never piled up. The
+  selection stays if the file is still changed; a refreshed diff replaces the old one without a
+  spinner.
+- The clickable file row is shared with the commit details panel (`ui/file_row.rs`).
+- Verified on Windows with the demo repository: a modified file (two hunks), a deleted file (all
+  red) and an untracked file (all green).
+
+## Backlog
+
+Ideas agreed for later, not scheduled into a step yet.
+
+- Commit tab: replace the status letters (M, A, D, !) with drawn icons (generic shapes, no third-party marks).
+- Commit tab: detect renames in the working tree and show them as one renamed file (as GitHub Desktop
+  does), not as a deleted plus an added file. Needs rename detection that includes untracked files
+  (e.g. intent-to-add or comparing contents) and patch generation that keeps both halves together.
+
 ## Open questions
 
-- Submodules (Milestone 3): proposed design given to the user on 2026-10-31, awaiting a decision.
+- None.
 
 ## To verify on Fedora (deferred; batched for later)
 
 - Window opens under Wayland; close works.
 - Window size restore. Wayland compositors may ignore the requested size or maximized state.
 - Reopening the last repository, branch and dividers after a restart (`~/.config/gitcraft/config.toml`).
+- Commit tab: status and diffs on Linux (`/dev/null` with `--no-index`, file names with `:` or a backslash), and the focus refresh under Wayland.
 
 ## Known issues / notes
 

@@ -118,11 +118,18 @@ pub struct RepoLayout {
     pub details_ratio: f32,
     /// Whether the details panel's "More info" is open.
     pub details_expanded: bool,
+    /// The Commit tab's changed-files list's share of the width.
+    pub changes_ratio: f32,
 }
 
 impl Default for RepoLayout {
     fn default() -> Self {
-        RepoLayout { history_ratio: split::DEFAULT_HISTORY_RATIO, details_ratio: split::DEFAULT_DETAILS_RATIO, details_expanded: false }
+        RepoLayout {
+            history_ratio: split::DEFAULT_HISTORY_RATIO,
+            details_ratio: split::DEFAULT_DETAILS_RATIO,
+            details_expanded: false,
+            changes_ratio: split::DEFAULT_CHANGES_RATIO,
+        }
     }
 }
 
@@ -159,7 +166,7 @@ pub fn body(ui: &mut egui::Ui, view: &BodyView<'_>, layout: &mut RepoLayout) -> 
     // of them to borrow a given variable mutably.
     let (mut row, mut action) = (None, None);
     // `RepoLayout`'s fields are borrowed separately, so each closure can change its own.
-    let RepoLayout { history_ratio, details_ratio, details_expanded } = layout;
+    let RepoLayout { history_ratio, details_ratio, details_expanded, .. } = layout;
     split::two_panes(
         ui,
         &history_split,

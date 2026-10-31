@@ -2,6 +2,8 @@
 
 mod parse;
 
+pub(crate) use parse::parse_patch;
+
 use crate::command::RunOptions;
 use crate::error::{GitError, Result};
 use crate::hash::parse_hash;
@@ -12,6 +14,11 @@ use crate::repo::Repo;
 pub const MAX_DIFF_LINES: usize = 20_000;
 /// Most bytes of patch accepted for one file (beyond it the diff is refused as too large).
 pub const MAX_DIFF_BYTES: usize = 4 * 1024 * 1024;
+
+/// Options for every diff we parse. The user's config must not change the output, or run
+/// programs: no external diff tools, no text conversion filters, standard a/ and b/ prefixes, no
+/// colour, three lines of context.
+pub(crate) const DIFF_FORMAT_ARGS: [&str; 6] = ["--no-ext-diff", "--no-textconv", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "-U3"];
 
 /// What a line of a diff is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,20 +83,8 @@ impl Git {
         let commit = hash(&request.commit)?;
         let parent = request.parent.as_deref().map(hash).transpose()?;
 
-        let mut args: Vec<&str> = vec![
-            "diff-tree",
-            "-p",
-            "--no-commit-id",
-            "--find-renames",
-            // The user's config must not change the output we parse, or run programs: no external
-            // diff tools, no text conversion filters, standard a/ and b/ prefixes, no colour.
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            "--src-prefix=a/",
-            "--dst-prefix=b/",
-            "-U3",
-        ];
+        let mut args: Vec<&str> = vec!["diff-tree", "-p", "--no-commit-id", "--find-renames"];
+        args.extend(DIFF_FORMAT_ARGS);
         match &parent {
             Some(parent) => args.extend([parent.as_str(), commit.as_str()]),
             None => args.extend(["--root", commit.as_str()]),
@@ -103,6 +98,6 @@ impl Git {
 
         let options = RunOptions { max_output: MAX_DIFF_BYTES, ..RunOptions::default() };
         let output = self.run_with(repo.root(), &args, &options)?;
-        Ok(parse::parse_patch(&output, MAX_DIFF_LINES))
+        Ok(parse_patch(&output, MAX_DIFF_LINES))
     }
 }

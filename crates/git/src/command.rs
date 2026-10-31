@@ -18,11 +18,14 @@ pub struct RunOptions {
     pub timeout: Duration,
     /// Most stdout bytes accepted; beyond this the command fails with `OutputTooLarge`.
     pub max_output: usize,
+    /// Exit codes besides 0 that mean success. `git diff --no-index` exits with 1 when the files
+    /// differ, which is exactly the case we want.
+    pub also_ok: &'static [i32],
 }
 
 impl Default for RunOptions {
     fn default() -> Self {
-        Self { timeout: Duration::from_secs(60), max_output: 64 * 1024 * 1024 }
+        Self { timeout: Duration::from_secs(60), max_output: 64 * 1024 * 1024, also_ok: &[] }
     }
 }
 
@@ -77,7 +80,8 @@ impl Git {
 
         let name = command_name(args);
         let output = run_process(command, options, &name)?;
-        if output.status.success() { Ok(output.stdout) } else { Err(classify_failure(name, cwd, output.status.code(), &output.stderr)) }
+        let accepted = output.status.code().is_some_and(|code| options.also_ok.contains(&code));
+        if output.status.success() || accepted { Ok(output.stdout) } else { Err(classify_failure(name, cwd, output.status.code(), &output.stderr)) }
     }
 }
 
