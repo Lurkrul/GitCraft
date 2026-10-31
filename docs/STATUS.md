@@ -11,8 +11,8 @@ Apache-2.0, matching craft-libs.
 |---|---|---|
 | 1 | Workspace scaffold, lints, craft-libs pin, empty window | done |
 | 4a | Settings: remember window size and maximized state (done early, on request) | done |
-| 2 | `gitcraft-git`: locate git, run commands, validate repo, parse log | next |
-| 3 | Worker thread, folder picker, commit list, status bar | |
+| 2 | `gitcraft-git`: locate git, run commands, validate repo, parse log | done |
+| 3 | Worker thread, folder picker, commit list, status bar | next |
 | 4b | Settings: remember and reopen the last repository | |
 
 ## Done
@@ -26,6 +26,19 @@ Apache-2.0, matching craft-libs.
   to defaults. Settings problems (damaged file, read-only folder, failed save) show in the status bar.
 - Verified on Windows: resize → restart keeps size; maximize → restart opens maximized, and restoring
   returns to the earlier size.
+- `gitcraft-git` crate (std only, no UI):
+  - `Git::locate()` finds `git` (`git.exe` only on Windows) on the PATH, skipping relative PATH
+    entries, and checks `git --version`.
+  - `Git::run`: no shell, no prompts (`GIT_TERMINAL_PROMPT=0`), English messages, no optional
+    locks, no console window on Windows, 60 s timeout, 64 MiB output cap, stdout and stderr read on
+    separate threads. Error messages name only the subcommand, never the full arguments.
+  - `Git::open_repo` resolves the top of the working tree. Specific errors for a missing folder,
+    not a repository, a bare repository or `.git` folder, and dubious ownership (`safe.directory`,
+    with the command to fix it).
+  - `Git::log(repo, limit)` reads HEAD's history (`-z`, NUL-separated fields). An empty repo gives
+    an empty log, and `truncated` is set when there are more commits than the limit. The parser
+    validates hashes (SHA-1 and SHA-256), parents and times; invalid UTF-8 in names is replaced.
+  - Try it by hand: `cargo run -p gitcraft-git --example log -- <folder> [limit]`.
 
 ## To verify on Fedora (deferred; batched for later)
 
@@ -33,6 +46,11 @@ Apache-2.0, matching craft-libs.
 - Window size restore. Wayland compositors may ignore the requested size or maximized state.
 
 ## Known issues / notes
+
+- The log follows HEAD only. Milestone 2 (graph, branch filter) will decide on `--all` and
+  `--topo-order`.
+- Running git on a timeout leaves its reader threads blocked if a grandchild process (such as ssh)
+  keeps the pipes open. That only matters for network commands (Milestone 3), so revisit then.
 
 - The `[patch.crates-io]` lines in the root `Cargo.toml` must be updated whenever the craft-libs rev
   changes.

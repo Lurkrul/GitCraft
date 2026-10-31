@@ -1,0 +1,17 @@
+[package]
+name = "gitcraft-git"
+description = "GitCraft's git layer: runs the system git and parses its machine-readable output. No UI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# Standard library only: git is run as a subprocess.
+[dependencies]
+
+[dev-dependencies]
+tempfile = { workspace = true }

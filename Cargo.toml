@@ -18,6 +18,8 @@ craft-quit = { git = "https://github.com/storytold/craft-libs", rev = "c39e435cc
 craft-settings = { git = "https://github.com/storytold/craft-libs", rev = "c39e435cc34417843793df240a0b38bac970179b" }
 craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "c39e435cc34417843793df240a0b38bac970179b" }
 
+gitcraft-git = { path = "crates/git" }
+
 egui = { version = "0.37", default-features = false }
 eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "wayland", "x11"] }
 serde = { version = "1", features = ["derive"] }

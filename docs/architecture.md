@@ -5,7 +5,7 @@
 | Crate | Path | Role | May depend on |
 |---|---|---|---|
 | `gitcraft` | `crates/app` | The egui app (binary): windows, panels, input | everything below |
-| `gitcraft-git` | `crates/git` | Runs the system `git` and parses its output. No UI. | std, serde |
+| `gitcraft-git` | `crates/git` | Runs the system `git` and parses its output. No UI. | std only |
 | `gitcraft-github` | `crates/github` | GitHub REST + GraphQL client. No UI. (Milestone 4) | |
 
 The lower crates never depend on egui, so the compiler keeps UI code out of them and they can be
