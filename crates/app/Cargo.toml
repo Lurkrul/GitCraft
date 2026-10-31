@@ -1,0 +1,21 @@
+[package]
+name = "gitcraft"
+description = "GitCraft: git, GitHub Issues and GitHub Projects in one native window"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+craft-quit = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+craft-settings = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
