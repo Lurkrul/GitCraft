@@ -2,7 +2,7 @@
 
 Last updated: 2026-10-31
 
-## Current milestone: 1, Skeleton
+## Milestones 1 and 2 are done. Next: Milestone 3, Git actions (needs a plan first)
 
 Plan (approved 2026-10-31): a Cargo workspace (`crates/app`, `crates/git`); licence MIT OR
 Apache-2.0, matching craft-libs.
@@ -13,7 +13,7 @@ Apache-2.0, matching craft-libs.
 | 4a | Settings: remember window size and maximized state (done early, on request) | done |
 | 2 | `gitcraft-git`: locate git, run commands, validate repo, parse log | done |
 | 3 | Worker thread, folder picker, commit list, status bar | done |
-| 4b | Settings: remember and reopen the last repository | moved to R7 below |
+| 4b | Settings: remember and reopen the last repository | done in R7 below |
 
 ## Done
 
@@ -66,7 +66,7 @@ repository name (full path on hover and in the window title).
 | R4 | Lane assignment (pure, tested), graph drawing, ref labels, initials avatars | done |
 | R5 | Two panes (craft-ui split), commit selection, details panel | done |
 | R6 | Diff parsing and diff view | done |
-| R7 | Reopen last repository; remember divider and branch per repository | next |
+| R7 | Reopen last repository; remember divider and branch per repository | done |
 
 R2 details:
 - File menu: Open Repository… (Ctrl+O), then Exit (added by craft-menu's layout). Help: About GitCraft.
@@ -141,6 +141,18 @@ R6 details:
   scrolled to the top (scroll areas have their own ids).
 - Verified on Windows: auto-selected first file, clicking another file, a new file shown all green.
 
+R7 details:
+- Settings gain `[layout]` (both divider ratios, rounded to 3 places, and "More info") and
+  `[repositories]` (up to 20 recent repositories, newest first, each with its branch or none for
+  "All branches"). Paths are compared as paths, so `/` and `\` match. Non-Unicode paths aren't saved.
+- Startup reopens the newest repository in the background. If it has gone, the status bar says why
+  and the welcome page shows. The saved branch is restored if it still exists, otherwise forgotten.
+- The branch is saved once its history has loaded (so a failed load doesn't save it).
+- Damaged ratios are clamped (0.1 to 0.9) or reset (not a number). The schema version stays 1:
+  missing sections fall back to defaults.
+- Verified on Windows with a hand-written config (forward slashes): the repository, branch and dividers
+  were restored, and the file came back with a single entry.
+
 ## Open questions
 
 - Submodules (Milestone 3): proposed design given to the user on 2026-10-31, awaiting a decision.
@@ -149,6 +161,7 @@ R6 details:
 
 - Window opens under Wayland; close works.
 - Window size restore. Wayland compositors may ignore the requested size or maximized state.
+- Reopening the last repository, branch and dividers after a restart (`~/.config/gitcraft/config.toml`).
 
 ## Known issues / notes
 
@@ -156,8 +169,6 @@ R6 details:
   icon (Polish milestone; list it in ATTRIBUTION.md).
 - No way to load history past the first 10,000 commits yet.
 
-- The log follows HEAD only. Milestone 2 (graph, branch filter) will decide on `--all` and
-  `--topo-order`.
 - Running git on a timeout leaves its reader threads blocked if a grandchild process (such as ssh)
   keeps the pipes open. That only matters for network commands (Milestone 3), so revisit then.
 

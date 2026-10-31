@@ -1,8 +1,13 @@
 //! GitCraft's settings, stored by craft-settings in `config.toml`
 //! (`%APPDATA%\gitcraft\` on Windows, `~/.config/gitcraft/` on Linux).
 
+use std::path::{Path, PathBuf};
+
 use craft_settings::{DocumentMut, LoadReport, MigrateError, Settings};
 use serde::{Deserialize, Serialize};
+
+use crate::ui::repository::RepoLayout;
+use crate::ui::split;
 
 /// Smallest window we allow (also the window's minimum size).
 pub const MIN_WINDOW_SIZE: [f32; 2] = [480.0, 320.0];
@@ -18,6 +23,8 @@ const DEFAULT_WINDOW_SIZE: [f32; 2] = [1100.0, 700.0];
 #[serde(default)]
 pub struct Prefs {
     pub window: WindowPrefs,
+    pub layout: LayoutPrefs,
+    pub repositories: RepositoryPrefs,
 }
 
 /// The main window's size, in egui points (logical pixels, independent of display scaling).
@@ -42,6 +49,108 @@ impl WindowPrefs {
     pub fn sanitized_size(&self) -> [f32; 2] {
         let side = |value: f32, default: f32, min: f32| if value.is_finite() { value.clamp(min, MAX_WINDOW_SIDE) } else { default };
         [side(self.width, DEFAULT_WINDOW_SIZE[0], MIN_WINDOW_SIZE[0]), side(self.height, DEFAULT_WINDOW_SIZE[1], MIN_WINDOW_SIZE[1])]
+    }
+}
+
+/// The Repository tab's dividers and the details panel's "More info" choice.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct LayoutPrefs {
+    /// The history's share of the width.
+    pub history_ratio: f64,
+    /// The details' share of the right pane's height.
+    pub details_ratio: f64,
+    pub details_expanded: bool,
+}
+
+impl Default for LayoutPrefs {
+    fn default() -> Self {
+        LayoutPrefs::from(&RepoLayout::default())
+    }
+}
+
+// `From` is Rust's conversion trait, like a converting constructor in C++.
+impl From<&RepoLayout> for LayoutPrefs {
+    fn from(layout: &RepoLayout) -> Self {
+        // Rounded to 3 places in an f64 so the file reads `0.4`, not the f32's `0.4000000059604645`.
+        let round = |ratio: f32| (f64::from(ratio) * 1000.0).round() / 1000.0;
+        LayoutPrefs {
+            history_ratio: round(layout.history_ratio),
+            details_ratio: round(layout.details_ratio),
+            details_expanded: layout.details_expanded,
+        }
+    }
+}
+
+impl LayoutPrefs {
+    /// The saved layout made safe to use: ratios from the file can be anything.
+    pub fn to_layout(&self) -> RepoLayout {
+        // `as f32` turns huge values into infinity and keeps NaN; `sane_ratio` handles both.
+        RepoLayout {
+            history_ratio: split::sane_ratio(self.history_ratio as f32),
+            details_ratio: split::sane_ratio(self.details_ratio as f32),
+            details_expanded: self.details_expanded,
+        }
+    }
+}
+
+/// Most repositories remembered; the oldest is forgotten first.
+pub const MAX_RECENT_REPOSITORIES: usize = 20;
+
+/// Repositories opened before, most recent first. The first is reopened at startup.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct RepositoryPrefs {
+    pub recent: Vec<RecentRepository>,
+}
+
+/// One remembered repository.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct RecentRepository {
+    /// The repository's top folder. A `String`, not a `PathBuf`: TOML can only hold text, so a
+    /// path that isn't valid Unicode is simply not remembered.
+    pub path: String,
+    /// The branch shown in the dropdown (a full ref name such as `refs/heads/main`), or `None`
+    /// for "All branches".
+    pub branch: Option<String>,
+}
+
+impl RecentRepository {
+    /// Whether this entry is the folder `root`. Compared as paths, not text, so `E:/src/x` and
+    /// `E:\src\x` (a hand-edited file, say) are the same repository.
+    fn is(&self, root: &Path) -> bool {
+        Path::new(&self.path) == root
+    }
+}
+
+impl RepositoryPrefs {
+    /// The repository to reopen at startup.
+    pub fn last(&self) -> Option<PathBuf> {
+        self.recent.first().filter(|recent| !recent.path.is_empty()).map(|recent| PathBuf::from(&recent.path))
+    }
+
+    /// The branch remembered for `root`, if any.
+    pub fn branch_for(&self, root: &Path) -> Option<&str> {
+        self.recent.iter().find(|recent| recent.is(root))?.branch.as_deref()
+    }
+
+    /// Records that `root` was opened: it moves to the front (keeping its branch) and the list is
+    /// trimmed to its maximum. A non-Unicode path is skipped.
+    pub fn opened(&mut self, root: &Path) {
+        let Some(path) = root.to_str() else {
+            return;
+        };
+        let branch = self.recent.iter().position(|recent| recent.is(root)).and_then(|index| self.recent.remove(index).branch);
+        self.recent.insert(0, RecentRepository { path: path.to_string(), branch });
+        self.recent.truncate(MAX_RECENT_REPOSITORIES);
+    }
+
+    /// Records the branch shown for `root` (`None` for all branches), if `root` is remembered.
+    pub fn set_branch(&mut self, root: &Path, branch: Option<String>) {
+        if let Some(recent) = self.recent.iter_mut().find(|recent| recent.is(root)) {
+            recent.branch = branch;
+        }
     }
 }
 
@@ -105,6 +214,94 @@ mod tests {
         }
         let (store, _) = SettingsStore::<Prefs>::open_at(dir.path());
         assert_eq!(store.get().window, WindowPrefs { width: 1234.0, height: 567.0, maximized: true });
+    }
+
+    fn root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(name)
+    }
+
+    #[test]
+    fn opened_repositories_move_to_the_front_and_keep_their_branch() {
+        let mut repos = RepositoryPrefs::default();
+        repos.opened(&root("a"));
+        repos.set_branch(&root("a"), Some("refs/heads/feature".into()));
+        repos.opened(&root("b"));
+        assert_eq!(repos.last(), Some(root("b")));
+        repos.opened(&root("a"));
+        assert_eq!(repos.last(), Some(root("a")));
+        assert_eq!(repos.recent.len(), 2, "no duplicates");
+        assert_eq!(repos.branch_for(&root("a")), Some("refs/heads/feature"));
+        assert_eq!(repos.branch_for(&root("b")), None);
+    }
+
+    #[test]
+    fn the_recent_list_is_capped() {
+        let mut repos = RepositoryPrefs::default();
+        for n in 0..MAX_RECENT_REPOSITORIES + 5 {
+            repos.opened(&root(&format!("repo{n}")));
+        }
+        assert_eq!(repos.recent.len(), MAX_RECENT_REPOSITORIES);
+        assert_eq!(repos.last(), Some(root(&format!("repo{}", MAX_RECENT_REPOSITORIES + 4))));
+    }
+
+    #[test]
+    fn a_branch_for_an_unknown_repository_is_ignored() {
+        let mut repos = RepositoryPrefs::default();
+        repos.set_branch(&root("never-opened"), Some("refs/heads/main".into()));
+        assert!(repos.recent.is_empty());
+        assert_eq!(repos.last(), None);
+    }
+
+    #[test]
+    fn an_empty_saved_path_is_not_reopened() {
+        let repos = RepositoryPrefs { recent: vec![RecentRepository::default()] };
+        assert_eq!(repos.last(), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn either_slash_finds_the_same_repository() {
+        let mut repos = RepositoryPrefs { recent: vec![RecentRepository { path: "E:/src/demo".into(), branch: Some("refs/heads/x".into()) }] };
+        assert_eq!(repos.branch_for(Path::new(r"E:\src\demo")), Some("refs/heads/x"));
+        repos.opened(Path::new(r"E:\src\demo"));
+        assert_eq!(repos.recent.len(), 1, "no duplicate entry");
+        assert_eq!(repos.recent[0].branch.as_deref(), Some("refs/heads/x"));
+    }
+
+    #[test]
+    fn saved_ratios_are_rounded() {
+        let layout = RepoLayout { history_ratio: 0.4, details_ratio: 0.123_456, details_expanded: false };
+        let prefs = LayoutPrefs::from(&layout);
+        assert_eq!((prefs.history_ratio, prefs.details_ratio), (0.4, 0.123));
+    }
+
+    #[test]
+    fn damaged_ratios_are_made_sane() {
+        let prefs = LayoutPrefs { history_ratio: f64::NAN, details_ratio: 40.0, details_expanded: true };
+        let layout = prefs.to_layout();
+        assert_eq!(layout.history_ratio, 0.5);
+        assert_eq!(layout.details_ratio, 0.9);
+        assert!(layout.details_expanded);
+    }
+
+    #[test]
+    fn layout_and_repositories_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = LayoutPrefs { history_ratio: 0.3, details_ratio: 0.6, details_expanded: true };
+        {
+            let (mut store, _) = SettingsStore::<Prefs>::open_at(dir.path());
+            store.update(|p| {
+                p.layout = layout.clone();
+                p.repositories.opened(&root("a"));
+                p.repositories.set_branch(&root("a"), Some("refs/heads/main".into()));
+            });
+            store.flush().unwrap();
+        }
+        let (store, report) = SettingsStore::<Prefs>::open_at(dir.path());
+        assert_eq!(load_problem_message(&report), None);
+        assert_eq!(store.get().layout, layout);
+        assert_eq!(store.get().repositories.last(), Some(root("a")));
+        assert_eq!(store.get().repositories.branch_for(&root("a")), Some("refs/heads/main"));
     }
 
     #[test]

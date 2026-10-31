@@ -11,7 +11,7 @@ use gitcraft_git::{DEFAULT_LOG_LIMIT, DiffRequest, LogScope, Refs, Repo};
 
 use crate::commands::Command;
 use crate::graph::History;
-use crate::settings::Prefs;
+use crate::settings::{LayoutPrefs, Prefs};
 use crate::ui::details::DetailsState;
 use crate::ui::diff_view::{self, DiffState, DiffView};
 use crate::ui::ref_labels::{self, LabelMap};
@@ -75,6 +75,11 @@ impl OpenRepo {
         let selected = self.selected.as_deref()?;
         self.history.log.commits.iter().position(|commit| commit.id == selected)
     }
+
+    /// Whether `name` (a full ref name) is a local or remote branch the dropdown offers.
+    fn has_branch(&self, name: &str) -> bool {
+        self.refs.branches().chain(self.refs.remote_branches()).any(|r| r.name == name)
+    }
 }
 
 /// All of the app's state. eframe owns it and calls `logic` and `ui` on it every frame.
@@ -110,7 +115,9 @@ impl GitCraftApp {
             Ok(worker) => (Some(worker), None),
             Err(err) => (None, Some(format!("Could not start GitCraft's background worker: {err}"))),
         };
-        Self {
+        let layout = settings.get().layout.to_layout();
+        let last_repository = settings.get().repositories.last();
+        let mut app = Self {
             settings,
             worker,
             dialogs: Dialogs::new(Arc::new(move || dialog_ctx.request_repaint())),
@@ -121,9 +128,15 @@ impl GitCraftApp {
             // The Commit tab comes first but has nothing to show until Milestone 3.
             tab: MainTab::Repository,
             about_open: false,
-            layout: RepoLayout::default(),
+            layout,
             scroll_to: None,
+        };
+        // Reopen the repository from last time. If it has gone (deleted, or on a drive that isn't
+        // plugged in), the status bar says so and the welcome page shows.
+        if let Some(path) = last_repository {
+            app.open_folder(path);
         }
+        app
     }
 
     /// Runs a command chosen from the menu or by its shortcut.
@@ -232,8 +245,22 @@ impl GitCraftApp {
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::Opened { repo, refs, history } => {
-                self.open = Some(OpenRepo::new(repo, refs, history));
+                let open = OpenRepo::new(repo, refs, history);
+                let root = open.repo.root().to_path_buf();
+                // Show the branch picked last time, if it still exists; otherwise forget it.
+                let saved = self.settings.get().repositories.branch_for(&root).map(str::to_string);
+                let restore = saved.as_deref().is_some_and(|name| open.has_branch(name));
+                self.settings.update(|prefs| {
+                    prefs.repositories.opened(&root);
+                    if !restore {
+                        prefs.repositories.set_branch(&root, None);
+                    }
+                });
+                self.open = Some(open);
                 self.error = None;
+                if let Some(name) = saved.filter(|_| restore) {
+                    self.select_scope(LogScope::Ref(name));
+                }
             }
             // The repository already on screen (if any) stays; the error explains what happened.
             Event::OpenFailed { path, error } => self.error = Some(open_failure_message(&path, &error)),
@@ -242,6 +269,13 @@ impl GitCraftApp {
                 // repository or picked another branch while this one loaded.
                 if let Some(open) = self.open.as_mut().filter(|open| open.repo == repo && open.selected_scope == scope) {
                     open.history = history;
+                    // Remembered for the next time this repository opens.
+                    let branch = match &scope {
+                        LogScope::AllBranches => None,
+                        LogScope::Ref(name) => Some(name.clone()),
+                    };
+                    let root = open.repo.root();
+                    self.settings.update(|prefs| prefs.repositories.set_branch(root, branch));
                     open.log_scope = scope;
                     // The selection stays if the commit is in this history too; otherwise it goes.
                     if open.selected_row().is_none() {
@@ -457,6 +491,16 @@ impl GitCraftApp {
             None => {}
         }
         about::show(ui.ctx(), &mut self.about_open);
+        self.remember_layout();
+    }
+
+    /// Saves the dividers and "More info" when they change (a drag changes them every frame;
+    /// the store waits until 500 ms after the last change before writing).
+    fn remember_layout(&mut self) {
+        let layout = LayoutPrefs::from(&self.layout);
+        if self.settings.get().layout != layout {
+            self.settings.update(|prefs| prefs.layout = layout);
+        }
     }
 
     /// Selects the commit in row `row` of the history.
@@ -1008,6 +1052,84 @@ mod tests {
         settle(&mut app, &ctx);
         app.select_file("missing.txt".into());
         assert_eq!(app.open.as_ref().unwrap().selected_file.as_deref(), Some("a.txt"));
+    }
+
+    /// An app started with `prefs` already saved, as after a restart (still in memory only).
+    fn app_with_prefs(ctx: &egui::Context, prefs: Prefs) -> GitCraftApp {
+        let (mut store, _) = SettingsStore::open(Location::Memory);
+        store.update(|saved| *saved = prefs);
+        GitCraftApp::new(ctx, store, None)
+    }
+
+    fn open_root(app: &GitCraftApp) -> Option<PathBuf> {
+        app.open.as_ref().map(|open| open.repo.root().to_path_buf())
+    }
+
+    #[test]
+    fn a_restart_reopens_the_last_repository_on_its_branch() {
+        let repo = repo_with_feature_branch();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.select_scope(LogScope::Ref("refs/heads/main".into()));
+        settle(&mut app, &ctx);
+        let root = open_root(&app).unwrap();
+        assert_eq!(app.settings.get().repositories.last(), Some(root.clone()));
+
+        let ctx = egui::Context::default();
+        let mut restarted = app_with_prefs(&ctx, app.settings.get().clone());
+        settle(&mut restarted, &ctx);
+        assert_eq!(open_root(&restarted), Some(root));
+        assert_eq!(restarted.open.as_ref().unwrap().selected_scope, LogScope::Ref("refs/heads/main".into()));
+        assert_eq!(summaries(&restarted), ["Base"]);
+    }
+
+    #[test]
+    fn a_remembered_branch_that_is_gone_falls_back_to_all_branches() {
+        let repo = repo_with_feature_branch();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.select_scope(LogScope::Ref("refs/heads/feature".into()));
+        settle(&mut app, &ctx);
+        repo.git(&["branch", "-D", "feature"]);
+
+        let ctx = egui::Context::default();
+        let mut restarted = app_with_prefs(&ctx, app.settings.get().clone());
+        settle(&mut restarted, &ctx);
+        let root = open_root(&restarted).unwrap();
+        assert_eq!(restarted.open.as_ref().unwrap().selected_scope, LogScope::AllBranches);
+        assert_eq!(restarted.settings.get().repositories.branch_for(&root), None, "forgotten");
+        assert!(matches!(restarted.status_line(), StatusLine::Info(_)), "no error for this");
+    }
+
+    #[test]
+    fn a_last_repository_that_is_gone_shows_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("deleted-repo");
+        let mut prefs = Prefs::default();
+        prefs.repositories.opened(&missing);
+
+        let ctx = egui::Context::default();
+        let mut app = app_with_prefs(&ctx, prefs);
+        settle(&mut app, &ctx);
+        assert!(app.open.is_none());
+        match app.status_line() {
+            StatusLine::Error(text) => assert!(text.contains("deleted-repo"), "{text}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_layout_is_restored_and_saved() {
+        let prefs = Prefs { layout: LayoutPrefs { history_ratio: 0.3, details_ratio: 0.7, details_expanded: false }, ..Prefs::default() };
+        let ctx = egui::Context::default();
+        let mut app = app_with_prefs(&ctx, prefs);
+        assert_eq!(app.layout, RepoLayout { history_ratio: 0.3, details_ratio: 0.7, details_expanded: false });
+
+        app.layout.details_expanded = true; // as if "More info" were clicked
+        run_frame(&mut app, &ctx, egui::RawInput::default());
+        assert!(app.settings.get().layout.details_expanded);
     }
 
     #[test]
