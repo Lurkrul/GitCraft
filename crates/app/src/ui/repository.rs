@@ -2,10 +2,12 @@
 
 use std::path::Path;
 
-use gitcraft_git::{Commit, LogScope, Ref, Refs};
+use gitcraft_git::{LogScope, Ref, Refs};
 
 use crate::commands::Command;
+use crate::graph::History;
 use crate::ui::commit_list;
+use crate::ui::ref_labels::LabelMap;
 
 const ALL_BRANCHES: &str = "All branches";
 /// Most rows the open dropdown shows before it scrolls.
@@ -89,13 +91,13 @@ pub fn toolbar(ui: &mut egui::Ui, root: &Path, refs: &Refs, selected: &LogScope)
 }
 
 /// The history area, below the toolbar.
-pub fn body(ui: &mut egui::Ui, commits: &[Commit]) {
-    if commits.is_empty() {
+pub fn body(ui: &mut egui::Ui, history: &History, labels: &LabelMap) {
+    if history.log.commits.is_empty() {
         ui.centered_and_justified(|ui| {
             ui.label("This repository has no commits yet.");
         });
     } else {
-        commit_list::show(ui, commits);
+        commit_list::show(ui, history, labels);
     }
 }
 

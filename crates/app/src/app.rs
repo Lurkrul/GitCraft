@@ -7,10 +7,12 @@ use std::time::Instant;
 use craft_dialogs::{Answer, Dialogs, FileDialog};
 use craft_menu::MenuBar;
 use craft_settings::{SaveStatus, SettingsStore};
-use gitcraft_git::{DEFAULT_LOG_LIMIT, Log, LogScope, Refs, Repo};
+use gitcraft_git::{DEFAULT_LOG_LIMIT, LogScope, Refs, Repo};
 
 use crate::commands::Command;
+use crate::graph::History;
 use crate::settings::Prefs;
+use crate::ui::ref_labels::{self, LabelMap};
 use crate::ui::status_bar::StatusLine;
 use crate::ui::tabs::MainTab;
 use crate::ui::{about, menu, placeholder, repository, status_bar, tabs};
@@ -31,7 +33,9 @@ enum DialogPurpose {
 struct OpenRepo {
     repo: Repo,
     refs: Refs,
-    log: Log,
+    /// Branch and tag labels by commit, rebuilt whenever `refs` changes.
+    labels: LabelMap,
+    history: History,
     /// The branch chosen in the dropdown. Can be ahead of `log_scope` while its history loads.
     selected_scope: LogScope,
     /// The scope `log` was read with.
@@ -186,18 +190,19 @@ impl GitCraftApp {
 
     fn handle_event(&mut self, event: Event) {
         match event {
-            Event::Opened { repo, refs, log } => {
+            Event::Opened { repo, refs, history } => {
                 let scope = LogScope::AllBranches;
-                self.open = Some(OpenRepo { repo, refs, log, selected_scope: scope.clone(), log_scope: scope });
+                let labels = ref_labels::label_map(&refs);
+                self.open = Some(OpenRepo { repo, refs, labels, history, selected_scope: scope.clone(), log_scope: scope });
                 self.error = None;
             }
             // The repository already on screen (if any) stays; the error explains what happened.
             Event::OpenFailed { path, error } => self.error = Some(open_failure_message(&path, &error)),
-            Event::LogLoaded { repo, scope, log } => {
+            Event::LogLoaded { repo, scope, history } => {
                 // Only if it is still what the user wants to see: they may have opened another
                 // repository or picked another branch while this one loaded.
                 if let Some(open) = self.open.as_mut().filter(|open| open.repo == repo && open.selected_scope == scope) {
-                    open.log = log;
+                    open.history = history;
                     open.log_scope = scope;
                     self.error = None;
                 }
@@ -297,11 +302,11 @@ impl GitCraftApp {
         }
         match &self.open {
             None => StatusLine::Info("No repository open".to_string()),
-            Some(open) if open.log.truncated => {
+            Some(open) if open.history.log.truncated => {
                 StatusLine::Info(format!("Showing the newest {} commits; older history is not loaded yet", group_thousands(DEFAULT_LOG_LIMIT)))
             }
             Some(open) => {
-                let count = open.log.commits.len();
+                let count = open.history.log.commits.len();
                 StatusLine::Info(format!("{} commit{}", group_thousands(count), if count == 1 { "" } else { "s" }))
             }
         }
@@ -330,7 +335,7 @@ impl GitCraftApp {
         let status = self.status_line();
         egui::Panel::bottom("status_bar").show(ui, |ui| status_bar::show(ui, &status));
         egui::CentralPanel::default().show(ui, |ui| match (self.tab, &self.open) {
-            (MainTab::Repository, Some(open)) => repository::body(ui, &open.log.commits),
+            (MainTab::Repository, Some(open)) => repository::body(ui, &open.history, &open.labels),
             (MainTab::Repository, None) => repository::welcome(ui),
             (MainTab::Commit, _) => placeholder::coming_later(ui, "Committing", 3),
             (MainTab::Issues, _) => placeholder::coming_later(ui, "Issues", 5),
@@ -539,7 +544,7 @@ mod tests {
     }
 
     fn summaries(app: &GitCraftApp) -> Vec<String> {
-        app.open.as_ref().map(|open| open.log.commits.iter().map(|c| c.summary.clone()).collect()).unwrap_or_default()
+        app.open.as_ref().map(|open| open.history.log.commits.iter().map(|c| c.summary.clone()).collect()).unwrap_or_default()
     }
 
     #[test]
@@ -631,7 +636,7 @@ mod tests {
         open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
 
         let open = app.open.as_ref().expect("a repository should be open");
-        let summaries: Vec<_> = open.log.commits.iter().map(|c| c.summary.as_str()).collect();
+        let summaries: Vec<_> = open.history.log.commits.iter().map(|c| c.summary.as_str()).collect();
         assert_eq!(summaries, ["Third", "Second", "First"]);
         assert_eq!(app.status_line(), StatusLine::Info("3 commits".into()));
         // Draw a couple more frames with the table on screen.
@@ -649,7 +654,7 @@ mod tests {
         open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
         open_via_dialog(&mut app, &ctx, not_a_repo.path().to_path_buf());
 
-        assert_eq!(app.open.as_ref().map(|open| open.log.commits.len()), Some(1));
+        assert_eq!(app.open.as_ref().map(|open| open.history.log.commits.len()), Some(1));
         match app.status_line() {
             StatusLine::Error(text) => assert!(text.contains("is not a git repository"), "{text}"),
             other => panic!("expected an error, got {other:?}"),
@@ -712,7 +717,7 @@ mod tests {
         open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
         // Pretend the history went past the limit.
         if let Some(open) = app.open.as_mut() {
-            open.log.truncated = true;
+            open.history.log.truncated = true;
         }
         assert_eq!(app.status_line(), StatusLine::Info("Showing the newest 10,000 commits; older history is not loaded yet".into()));
     }

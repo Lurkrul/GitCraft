@@ -63,8 +63,8 @@ repository name (full path on hover and in the window title).
 | R1 | Commit step 3 | done (`f22430c`) |
 | R2 | Window shell: menu bar (craft-menu), tabs (craft-ui), repository toolbar | done |
 | R3 | Refs + branch dropdown filtering the history | done |
-| R4 | Lane assignment (pure, tested), graph drawing, ref labels, initials avatars | next |
-| R5 | Two panes (craft-ui split), commit selection, details panel | |
+| R4 | Lane assignment (pure, tested), graph drawing, ref labels, initials avatars | done |
+| R5 | Two panes (craft-ui split), commit selection, details panel | next |
 | R6 | Diff parsing and diff view | |
 | R7 | Reopen last repository; remember divider and branch per repository | |
 
@@ -86,6 +86,24 @@ R3 details:
   ignored. A failed load (branch deleted meanwhile) puts the dropdown back and shows the error.
 - Opening a repository now shows all branches (it used to show only HEAD's history).
 - Commit tab added as the first tab (placeholder until Milestone 3); the app starts on Repository.
+
+R4 details:
+- `graph/lanes.rs`: `assign_lanes(&[Commit]) -> Vec<GraphRow>`, a pure function. Each row has the
+  commit's lane and colour, plus the segments crossing its top and bottom halves. Lanes never move
+  sideways and freed lanes are reused. Unit tests cover linear history, a merge with its fork point,
+  two tips from one commit, a merge parent that is already waited for, an octopus merge, lane
+  reuse, truncated history, duplicated parents, and segments staying inside the row width.
+- `graph/paint.rs`: straight lines within a lane, S-curves (cubic Béziers) between lanes, an
+  8-colour palette, a dot per commit (smaller for merges). The column
+  is capped at 16 lanes.
+- Lanes are computed on the worker thread (`graph::History`), not in the UI.
+- Avatars (initials) sit before each summary, not in the graph. Each author keeps one colour,
+  from an FNV-1a hash of their email (top bits; the low bits barely mix).
+- Labels beside the summary: the checked-out branch first (bold), then local branches (filled in
+  the lane colour), remote branches (outlined) and tags (grey). A detached HEAD gets a "HEAD" label.
+- The list shows only the graph and summaries (with labels). Author, date and hash move to the
+  details panel (R5); until then, hovering a summary shows them.
+- Verified on Windows with a demo repository (two feature branches, a merge, a tag, a remote).
 
 ## Open questions
 

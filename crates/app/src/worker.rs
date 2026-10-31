@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
-use gitcraft_git::{DEFAULT_LOG_LIMIT, Git, GitError, Log, LogScope, Refs, Repo};
+use gitcraft_git::{DEFAULT_LOG_LIMIT, Git, GitError, LogScope, Refs, Repo};
+
+use crate::graph::History;
 
 /// Called by the worker after each event, to make the UI repaint (and so poll) right away.
 /// `Arc<dyn Fn ...>` is a shared, thread-safe function object, like `std::shared_ptr<std::function<void()>>`.
@@ -31,9 +33,9 @@ pub enum Job {
 /// has already moved on.
 #[derive(Debug)]
 pub enum Event {
-    Opened { repo: Repo, refs: Refs, log: Log },
+    Opened { repo: Repo, refs: Refs, history: History },
     OpenFailed { path: PathBuf, error: GitError },
-    LogLoaded { repo: Repo, scope: LogScope, log: Log },
+    LogLoaded { repo: Repo, scope: LogScope, history: History },
     LogFailed { repo: Repo, scope: LogScope, error: GitError },
 }
 
@@ -111,11 +113,11 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, wake: Wake) {
     for job in jobs {
         let event = match job {
             Job::Open(path) => match open(&mut git, &path) {
-                Ok((repo, refs, log)) => Event::Opened { repo, refs, log },
+                Ok((repo, refs, history)) => Event::Opened { repo, refs, history },
                 Err(error) => Event::OpenFailed { path, error },
             },
             Job::LoadLog { repo, scope } => match located(&mut git).and_then(|git| git.log(&repo, &scope, DEFAULT_LOG_LIMIT)) {
-                Ok(log) => Event::LogLoaded { repo, scope, log },
+                Ok(log) => Event::LogLoaded { repo, scope, history: History::new(log) },
                 Err(error) => Event::LogFailed { repo, scope, error },
             },
         };
@@ -126,12 +128,13 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, wake: Wake) {
     }
 }
 
-fn open(git: &mut Option<Git>, path: &std::path::Path) -> Result<(Repo, Refs, Log), GitError> {
+fn open(git: &mut Option<Git>, path: &std::path::Path) -> Result<(Repo, Refs, History), GitError> {
     let git = located(git)?;
     let repo = git.open_repo(path)?;
     let refs = git.refs(&repo)?;
     let log = git.log(&repo, &LogScope::AllBranches, DEFAULT_LOG_LIMIT)?;
-    Ok((repo, refs, log))
+    // The graph is laid out here, on the background thread, not in the UI.
+    Ok((repo, refs, History::new(log)))
 }
 
 /// The cached `Git`, locating it first if needed.
@@ -170,7 +173,8 @@ mod tests {
         assert!(worker.is_busy());
 
         match next_event(&mut worker) {
-            Event::Opened { log, refs, .. } => {
+            Event::Opened { history, refs, .. } => {
+                let log = history.log;
                 let summaries: Vec<_> = log.commits.iter().map(|c| c.summary.as_str()).collect();
                 assert_eq!(summaries, ["Second", "First"]);
                 assert_eq!(refs.head_branch(), Some("refs/heads/main"));
@@ -202,7 +206,7 @@ mod tests {
 
         let counts: Vec<usize> = (0..2)
             .map(|_| match next_event(&mut worker) {
-                Event::Opened { log, .. } => log.commits.len(),
+                Event::Opened { history, .. } => history.log.commits.len(),
                 other => panic!("unexpected event: {other:?}"),
             })
             .collect();
@@ -217,15 +221,17 @@ mod tests {
         repo.git(&["checkout", "-q", "main"]);
         let mut worker = worker();
         worker.send(Job::Open(repo.path().to_path_buf()));
-        let Event::Opened { repo: opened, log, .. } = next_event(&mut worker) else {
+        let Event::Opened { repo: opened, history, .. } = next_event(&mut worker) else {
             panic!("expected Opened");
         };
-        assert_eq!(log.commits.len(), 2, "all branches");
+        assert_eq!(history.log.commits.len(), 2, "all branches");
+        assert_eq!(history.rows.len(), 2, "one graph row per commit");
 
         let scope = LogScope::Ref("refs/heads/main".into());
         worker.send(Job::LoadLog { repo: opened.clone(), scope: scope.clone() });
         match next_event(&mut worker) {
-            Event::LogLoaded { repo, scope: loaded, log } => {
+            Event::LogLoaded { repo, scope: loaded, history } => {
+                let log = history.log;
                 assert_eq!(repo, opened);
                 assert_eq!(loaded, scope);
                 assert_eq!(log.commits.iter().map(|c| c.summary.as_str()).collect::<Vec<_>>(), ["Base"]);

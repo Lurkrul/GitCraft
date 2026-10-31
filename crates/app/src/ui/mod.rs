@@ -5,6 +5,7 @@ pub mod about;
 pub mod commit_list;
 pub mod menu;
 pub mod placeholder;
+pub mod ref_labels;
 pub mod repository;
 pub mod status_bar;
 pub mod tabs;

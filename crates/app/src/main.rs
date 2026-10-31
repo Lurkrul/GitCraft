@@ -5,6 +5,7 @@
 
 mod app;
 mod commands;
+mod graph;
 mod settings;
 #[cfg(test)]
 mod test_support;
