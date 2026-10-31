@@ -39,6 +39,14 @@ your own.
 - [ ] Restart: the last repository reopens, with its branch and divider positions.
 - [ ] Rename or delete the last repository's folder, then restart: the status bar says why, and the
       welcome page shows.
+- [ ] File → Open Recent lists repositories opened before, newest first, with the open one checked.
+      Picking another opens it on its saved branch.
+- [ ] The toolbar's repository name is a dropdown with the same list (full path on hover), and
+      "Open other repository…" opens the folder picker.
+- [ ] A recent repository whose folder was deleted or renamed shows greyed out ("not found" in the
+      menu) after switching back to GitCraft.
+- [ ] File → Open Recent → Clear recent list leaves only the open repository.
+- [ ] With nothing remembered, Open Recent shows a greyed-out "No recent repositories".
 - [ ] A saved branch that has since been deleted is forgotten, and you get "All branches".
 
 ## Repository tab: history and graph
@@ -87,10 +95,8 @@ your own.
 - [ ] Every file starts ticked. The all/none box turns part-filled when the files are mixed.
 - [ ] Unticking a file and committing commits only the ticked files. The others stay, ticked again.
 - [ ] Ticks survive F5 and switching away from the window and back.
-- [ ] Files staged in a terminal (`git add`) before the tab reads them: the ticks match the index.
-      **(not checked yet)**
-- [ ] A file staged only in part shows a part-filled box and commits exactly its staged part.
-      **(not checked yet)**
+- [ ] Staging in a terminal (`git add`, `git add -p`, `git mv`) doesn't change the ticks: new changes
+      start ticked, and Commit takes exactly what is ticked.
 - [ ] With Summary empty, the Commit button is disabled and hovering it says why.
 - [ ] Ctrl+Enter in Summary or Description commits.
 - [ ] A successful commit clears the message box and reloads the repository.
@@ -98,6 +104,26 @@ your own.
 - [ ] Amending a commit that is already on a remote asks first ("Amend anyway"). **(not checked yet)**
 - [ ] A failing pre-commit hook (`exit 1`) shows git's output under the button and keeps the message.
       **(not checked yet)**
+
+## Commit tab: picking lines
+
+- [ ] Each added or removed line in the Commit tab's diff has a checkbox; context lines don't. The
+      Repository tab's diff has no checkboxes.
+- [ ] Unticking a line makes the file's box in the list part-filled; hovering it says only the
+      ticked lines will be committed.
+- [ ] Each hunk header has a box: part-filled when some of its lines are ticked. Clicking it unticks
+      a fully ticked hunk, and ticks anything else fully.
+- [ ] Shift+click a line ticks or unticks every changed line from the last clicked one.
+- [ ] Each block of changes (added/removed lines with no unchanged line between) has its own checkbox,
+      in the far-left column on the block's first line. Hovering it highlights the block; clicking
+      unticks a fully ticked block, and ticks anything else fully. Other blocks are unaffected.
+- [ ] Ticking every line again (or clicking the file's box) makes the file fully ticked.
+- [ ] Ticking one line of an unticked file ticks just that line.
+- [ ] Commit with some lines unticked: only the ticked lines are in the commit (check the Repository
+      tab), the file on disk is unchanged, and the rest still shows as a change.
+- [ ] Edit the file elsewhere (another part of it) and switch back: lines you unticked stay unticked.
+- [ ] A file whose old last line had no newline: ticking only the new line after it gives a clear
+      message under the Commit button, and nothing is committed.
 
 ## Commit tab: right-click menu
 

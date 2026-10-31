@@ -69,6 +69,12 @@ pub struct FileDiff {
 }
 
 impl FileDiff {
+    /// Reads a unified diff of one file, as git writes it (with the usual line limit). Never
+    /// fails: what can't be understood is left out, and then lines can't be picked.
+    pub fn parse(patch: &[u8]) -> FileDiff {
+        parse_patch(patch, MAX_DIFF_LINES)
+    }
+
     /// Whether single lines of this diff can be picked for a commit.
     pub fn can_pick_lines(&self) -> bool {
         self.source.is_some()

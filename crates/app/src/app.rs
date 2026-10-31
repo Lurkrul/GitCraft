@@ -1,5 +1,6 @@
 //! The GitCraft window: state, per-frame logic and drawing.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,6 +18,7 @@ use crate::ui::commit_tab::{self, Changes};
 use crate::ui::confirm::{self, Choice, Confirm};
 use crate::ui::details::DetailsState;
 use crate::ui::diff_view::{self, DiffState, DiffView};
+use crate::ui::recent::{self, RecentItem, RepositoryPick};
 use crate::ui::ref_labels::{self, LabelMap};
 use crate::ui::repository::RepoLayout;
 use crate::ui::status_bar::StatusLine;
@@ -113,8 +115,15 @@ pub struct GitCraftApp {
     open: Option<OpenRepo>,
     /// The latest problem to show in the status bar. Cleared when a repository opens.
     error: Option<String>,
-    /// The menus, laid out for this platform once at startup.
+    /// The menus, laid out for this platform. Laid out again when the recent list changes.
     menu_bar: MenuBar,
+    /// The recent repositories as the menu and toolbar show them (the menu was built from this).
+    recent: Vec<RecentItem>,
+    /// Recent repositories whose folder was missing when last checked.
+    missing_folders: BTreeSet<PathBuf>,
+    /// The recent paths last sent to the worker to check, so they are checked again only when the
+    /// list changes (or the window gets the focus back).
+    checked_folders: Vec<PathBuf>,
     /// The window title last sent to the OS, so it is only sent again when it changes.
     window_title: String,
     tab: MainTab,
@@ -155,7 +164,10 @@ impl GitCraftApp {
             dialogs: Dialogs::new(Arc::new(move || dialog_ctx.request_repaint())),
             open: None,
             error: worker_error.or(startup_problem),
-            menu_bar: menu::laid_out(),
+            menu_bar: menu::laid_out(&[]),
+            recent: Vec::new(),
+            missing_folders: BTreeSet::new(),
+            checked_folders: Vec::new(),
             window_title: APP_NAME.to_string(),
             tab: MainTab::Repository,
             about_open: false,
@@ -179,7 +191,50 @@ impl GitCraftApp {
                 self.tab = MainTab::Repository;
                 self.ask_for_repository();
             }
+            Command::ClearRecent => {
+                let open = self.open.as_ref().map(|open| open.repo.root().to_path_buf());
+                self.settings.update(|prefs| prefs.repositories.clear_except(open.as_deref()));
+            }
             Command::About => self.about_open = true,
+        }
+    }
+
+    /// Acts on something chosen from the menu bar.
+    fn handle_menu_choice(&mut self, choice: menu::Choice) {
+        match choice {
+            menu::Choice::Command(command) => self.run(command),
+            menu::Choice::OpenRecent(index) => {
+                // The index is into the list the menu was built from, which is `self.recent`.
+                if let Some(item) = self.recent.get(index).cloned() {
+                    self.open_recent(item.path);
+                }
+            }
+        }
+    }
+
+    /// Opens a repository picked from the recent list (menu or toolbar).
+    fn open_recent(&mut self, path: PathBuf) {
+        if self.open.as_ref().is_some_and(|open| open.repo.root() == path) {
+            return; // Already open.
+        }
+        self.tab = MainTab::Repository;
+        self.open_folder(path);
+    }
+
+    /// Keeps the recent list (and so the menu) in step with the settings, and has the worker check
+    /// which folders still exist whenever the list changes. Called every frame; cheap, since the
+    /// list holds at most 20 paths.
+    fn update_recent(&mut self) {
+        let paths = self.settings.get().repositories.paths();
+        if paths != self.checked_folders {
+            self.checked_folders = paths.clone();
+            self.send(Job::CheckFolders(paths.clone()));
+        }
+        let current = self.open.as_ref().map(|open| open.repo.root());
+        let items = recent::items(&paths, current, &self.missing_folders);
+        if items != self.recent {
+            self.menu_bar = menu::laid_out(&items);
+            self.recent = items;
         }
     }
 
@@ -374,6 +429,7 @@ impl GitCraftApp {
                     self.refresh_status();
                 }
             }
+            Event::FoldersChecked { missing } => self.missing_folders = missing,
             Event::Launched { result } => {
                 if let Err(message) = result {
                     self.error = Some(message);
@@ -384,10 +440,11 @@ impl GitCraftApp {
                 if let Some(open) =
                     self.open.as_mut().filter(|open| open.repo == repo && open.changes.selected.as_deref() == Some(request.path.as_str()))
                 {
-                    open.changes.diff = match result {
-                        Ok(diff) => DiffState::Loaded(Box::new(DiffView::new(diff))),
-                        Err(error) => DiffState::Failed(diff_view::failure_message(&error)),
-                    };
+                    match result {
+                        // Also moves the file's picked lines onto the new diff.
+                        Ok(diff) => open.changes.diff_loaded(&request.path, diff),
+                        Err(error) => open.changes.diff = DiffState::Failed(diff_view::failure_message(&error)),
+                    }
                 }
             }
             // The repository already on screen (if any) stays; the error explains what happened.
@@ -558,9 +615,10 @@ impl GitCraftApp {
     pub fn draw(&mut self, ui: &mut egui::Ui) {
         // Panels are added outside-in: menu bar, tab strip and (in the Repository tab) its
         // toolbar along the top, the status bar along the bottom, then the content fills the rest.
+        self.update_recent();
         let chosen = egui::Panel::top("menu_bar").show(ui, |ui| menu::show(ui, &self.menu_bar)).inner;
-        for command in chosen {
-            self.run(command);
+        for choice in chosen {
+            self.handle_menu_choice(choice);
         }
         let tab_before = self.tab;
         egui::Panel::top("tabs").show(ui, |ui| tabs::show(ui, &mut self.tab));
@@ -570,12 +628,15 @@ impl GitCraftApp {
         }
         if let (MainTab::Repository, Some(open)) = (self.tab, &self.open) {
             let picked = egui::Panel::top("repository_toolbar")
-                .show(ui, |ui| repository::toolbar(ui, open.repo.root(), &open.refs, &open.selected_scope))
+                .show(ui, |ui| repository::toolbar(ui, open.repo.root(), &open.refs, &open.selected_scope, &self.recent))
                 .inner;
             // Acted on after the panel closure ends, when `open` (a borrow of `self.open`) is no
             // longer in use and `self` can be changed.
-            if let Some(scope) = picked {
-                self.select_scope(scope);
+            match picked {
+                Some(repository::ToolbarPick::Scope(scope)) => self.select_scope(scope),
+                Some(repository::ToolbarPick::Repository(RepositoryPick::Open(path))) => self.open_recent(path),
+                Some(repository::ToolbarPick::Repository(RepositoryPick::Other)) => self.run(Command::OpenRepository),
+                None => {}
             }
         }
         let status = self.status_line();
@@ -722,8 +783,14 @@ impl GitCraftApp {
         let Some(open) = self.open.as_mut() else {
             return;
         };
-        let Some(request) = open.changes.commit_request() else {
-            return;
+        let request = match open.changes.commit_request() {
+            None => return, // The button is disabled; nothing to do.
+            Some(Ok(request)) => request,
+            Some(Err(message)) => {
+                // A file's picked lines can't make a patch: say why, commit nothing.
+                open.changes.commit_error = Some(format!("The commit was not made: {message}"));
+                return;
+            }
         };
         let pushed_to = open.changes.amend_info.as_ref().and_then(|info| info.pushed_to.as_deref());
         if let (true, false, Some(remote)) = (request.amend, confirmed, pushed_to) {
@@ -840,6 +907,11 @@ impl GitCraftApp {
     fn handle_refresh_keys(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|input| input.events.iter().any(|event| matches!(event, egui::Event::WindowFocused(true))));
         let f5 = ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F5));
+        if focused {
+            // A drive may have been connected or a folder deleted meanwhile: check the recent
+            // repositories again on the next frame.
+            self.checked_folders.clear();
+        }
         if focused || f5 {
             self.refresh_status();
         }
@@ -1077,6 +1149,90 @@ mod tests {
         app.open.as_ref().map(|open| open.history.log.commits.iter().map(|c| c.summary.clone()).collect()).unwrap_or_default()
     }
 
+    /// The recent list as the menu shows it: (folder name, open now, missing).
+    fn recent_names(app: &GitCraftApp) -> Vec<(String, bool, bool)> {
+        app.recent.iter().map(|item| (item.name(), item.current, item.missing)).collect()
+    }
+
+    #[test]
+    fn switching_through_the_recent_list_restores_each_branch() {
+        let first = repo_with_feature_branch();
+        let second = TestRepo::with_commits(&["Other"]);
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, first.path().to_path_buf());
+        let first_root = open_root(&app).unwrap();
+        app.select_scope(LogScope::Ref("refs/heads/feature".into()));
+        settle(&mut app, &ctx);
+        open_via_dialog(&mut app, &ctx, second.path().to_path_buf());
+
+        let names = recent_names(&app);
+        assert_eq!(names.len(), 2);
+        assert!(names[0].1 && !names[1].1, "the open one is first and marked: {names:?}");
+        assert_eq!(app.recent[1].path, first_root);
+        assert_eq!(open_recent(&app.menu_bar).len(), 3, "the menu was rebuilt with both, plus Clear");
+
+        // File → Open Recent → the first repository: it opens with its branch.
+        app.handle_menu_choice(menu::Choice::OpenRecent(1));
+        settle(&mut app, &ctx);
+        assert_eq!(open_root(&app), Some(first_root));
+        assert_eq!(app.open.as_ref().unwrap().selected_scope, LogScope::Ref("refs/heads/feature".into()));
+        assert_eq!(summaries(&app), ["Feature work", "Base"]);
+        assert!(app.recent[0].current, "it moved to the top");
+
+        // Picking the open one again does nothing; an index past the end is ignored.
+        app.handle_menu_choice(menu::Choice::OpenRecent(0));
+        app.handle_menu_choice(menu::Choice::OpenRecent(9));
+        assert!(!app.is_busy());
+    }
+
+    /// The Open Recent submenu's item ids.
+    fn open_recent(bar: &MenuBar) -> Vec<String> {
+        bar.items()
+            .iter()
+            .filter(|item| item.command.id.starts_with("file.open_recent.") || item.command.id == "file.clear_recent")
+            .map(|item| item.command.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn clearing_the_recent_list_keeps_the_open_repository() {
+        let first = TestRepo::with_commits(&["A"]);
+        let second = TestRepo::with_commits(&["B"]);
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, first.path().to_path_buf());
+        open_via_dialog(&mut app, &ctx, second.path().to_path_buf());
+        assert_eq!(app.recent.len(), 2);
+
+        app.handle_menu_choice(menu::Choice::Command(Command::ClearRecent));
+        settle(&mut app, &ctx);
+        assert_eq!(app.settings.get().repositories.paths(), [open_root(&app).unwrap()]);
+        assert_eq!(recent_names(&app).len(), 1);
+    }
+
+    #[test]
+    fn a_missing_recent_folder_is_greyed_out() {
+        let kept = TestRepo::with_commits(&["A"]);
+        let doomed = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        // Remembered from an earlier session, but the folder is about to go.
+        let gone = doomed.path().join("old-repo");
+        std::fs::create_dir(&gone).unwrap();
+        app.settings.update(|prefs| prefs.repositories.opened(&gone));
+        open_via_dialog(&mut app, &ctx, kept.path().to_path_buf());
+        assert!(recent_names(&app).iter().all(|(_, _, missing)| !missing), "both exist at first");
+
+        std::fs::remove_dir(&gone).unwrap();
+        app.checked_folders.clear(); // as when the window gets the focus back
+        settle(&mut app, &ctx);
+        let names = recent_names(&app);
+        assert_eq!(names[1], ("old-repo".to_string(), false, true), "{names:?}");
+        let item = app.menu_bar.items().into_iter().find(|item| item.command.id == "file.open_recent.1").cloned().unwrap();
+        assert!(!item.enabled, "greyed out in the menu");
+    }
+
     #[test]
     fn picking_a_branch_shows_only_its_history() {
         let repo = repo_with_feature_branch();
@@ -1290,7 +1446,7 @@ mod tests {
                     .iter()
                     .filter_map(|row| match row {
                         diff_view::DiffRow::Line { kind, text, .. } => Some((*kind, text.clone())),
-                        diff_view::DiffRow::Hunk(_) => None,
+                        diff_view::DiffRow::Hunk { .. } => None,
                     })
                     .collect(),
             ),
@@ -1592,6 +1748,64 @@ mod tests {
         let box_state = changes(&mut app);
         assert!(box_state.summary.is_empty() && !box_state.committing && box_state.commit_error.is_none());
         assert_eq!(summaries(&app)[0], "Add line three", "the history shows the new commit");
+    }
+
+    #[test]
+    fn commits_only_the_ticked_lines_of_a_file() {
+        let repo = TestRepo::with_commits(&[]);
+        let lines: String = (1..=12).map(|n| format!("{n}\n")).collect();
+        repo.commit_files(&[("f.txt", &lines)], "Root");
+        // Two hunks: line 2 and line 11 change.
+        let edited: String = (1..=12)
+            .map(|n| match n {
+                2 => "two\n".to_string(),
+                11 => "eleven\n".to_string(),
+                _ => format!("{n}\n"),
+            })
+            .collect();
+        std::fs::write(repo.path().join("f.txt"), &edited).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.tab = MainTab::Commit;
+        settle(&mut app, &ctx);
+        assert_eq!(selected_change(&app).as_deref(), Some("f.txt"));
+
+        // Untick the second hunk's box, as a click in the diff would.
+        let click = diff_view::TickClick { target: diff_view::TickTarget::Hunk(1), shift: false };
+        changes(&mut app).click_tick(click);
+        assert_eq!(changes(&mut app).tick("f.txt"), commit_tab::Tick::Lines);
+        changes(&mut app).summary = "Only two".into();
+        app.start_commit(false);
+        settle(&mut app, &ctx);
+
+        let committed: String = (1..=12).map(|n| if n == 2 { "two\n".to_string() } else { format!("{n}\n") }).collect();
+        assert_eq!(repo.git(&["show", "HEAD:f.txt"]) + "\n", committed);
+        assert_eq!(std::fs::read_to_string(repo.path().join("f.txt")).unwrap(), edited, "the file on disk is untouched");
+        assert_eq!(changed_paths(&app), ["f.txt"], "line 11 is still waiting");
+        assert_eq!(changes(&mut app).tick("f.txt"), commit_tab::Tick::All, "what is left starts ticked again");
+    }
+
+    #[test]
+    fn commits_one_block_of_a_hunk() {
+        let repo = TestRepo::with_commits(&[]);
+        repo.commit_files(&[("f.txt", "one\ntwo\nthree\nfour\nfive\n")], "Root");
+        // One hunk, two blocks: "two" and "four" both change.
+        std::fs::write(repo.path().join("f.txt"), "one\nTWO\nthree\nFOUR\nfive\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.tab = MainTab::Commit;
+        settle(&mut app, &ctx);
+
+        // Untick the first block ("two" → "TWO") with its handle.
+        changes(&mut app).click_tick(diff_view::TickClick { target: diff_view::TickTarget::Block(0), shift: false });
+        changes(&mut app).summary = "Only four".into();
+        app.start_commit(false);
+        settle(&mut app, &ctx);
+
+        assert_eq!(repo.git(&["show", "HEAD:f.txt"]), "one\ntwo\nthree\nFOUR\nfive");
+        assert_eq!(std::fs::read_to_string(repo.path().join("f.txt")).unwrap(), "one\nTWO\nthree\nFOUR\nfive\n");
     }
 
     #[test]

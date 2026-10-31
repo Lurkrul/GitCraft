@@ -10,6 +10,7 @@ pub mod diff_view;
 pub mod file_row;
 pub mod menu;
 pub mod placeholder;
+pub mod recent;
 pub mod ref_labels;
 pub mod repository;
 pub mod split;

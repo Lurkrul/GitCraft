@@ -10,6 +10,7 @@ use craft_ui::layout::SplitAxis;
 
 use crate::ui::details::{self, DetailsAction, DetailsState};
 use crate::ui::diff_view::{self, DiffState};
+use crate::ui::recent::{self, RecentItem, RepositoryPick};
 use crate::ui::ref_labels::LabelMap;
 use crate::ui::split::Split;
 use crate::ui::{commit_list, split};
@@ -66,9 +67,18 @@ pub fn repository_name(root: &Path) -> String {
     }
 }
 
-/// The toolbar under the tabs: branch dropdown on the left, then the repository name (full path
-/// on hover). Returns the scope the user picked this frame, if they picked a different one.
-pub fn toolbar(ui: &mut egui::Ui, root: &Path, refs: &Refs, selected: &LogScope) -> Option<LogScope> {
+/// Something picked in the toolbar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolbarPick {
+    /// Another branch (or all branches) in the branch dropdown.
+    Scope(LogScope),
+    /// A repository in the repository dropdown.
+    Repository(RepositoryPick),
+}
+
+/// The toolbar under the tabs: branch dropdown on the left, then the repository dropdown (its name,
+/// full path on hover; opened, the recent repositories). Returns what was picked this frame.
+pub fn toolbar(ui: &mut egui::Ui, root: &Path, refs: &Refs, selected: &LogScope, recent: &[RecentItem]) -> Option<ToolbarPick> {
     let mut picked = None;
     ui.horizontal(|ui| {
         ui.label("Branch:");
@@ -83,14 +93,17 @@ pub fn toolbar(ui: &mut egui::Ui, root: &Path, refs: &Refs, selected: &LogScope)
                     BranchRow::Choice { scope, label } => {
                         let is_selected = &scope == selected;
                         if ui.selectable_label(is_selected, label).clicked() && !is_selected {
-                            picked = Some(scope);
+                            picked = Some(ToolbarPick::Scope(scope));
                         }
                     }
                 }
             }
         });
         ui.separator();
-        ui.strong(repository_name(root)).on_hover_text(root.display().to_string());
+        ui.label("Repository:");
+        if let Some(pick) = recent::dropdown(ui, root, recent) {
+            picked = Some(ToolbarPick::Repository(pick));
+        }
     });
     picked
 }
@@ -178,7 +191,10 @@ pub fn body(ui: &mut egui::Ui, view: &BodyView<'_>, layout: &mut RepoLayout) -> 
                 &details_split,
                 details_ratio,
                 |ui| action = details::show(ui, view.details, details_expanded, view.selected_file),
-                |ui| diff_view::show(ui, view.diff, (view.selected, view.selected_file)),
+                |ui| {
+                    // No checkboxes here: committed history is only looked at.
+                    diff_view::show(ui, view.diff, (view.selected, view.selected_file), None);
+                },
             );
         },
     );

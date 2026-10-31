@@ -5,6 +5,7 @@
 //! which never blocks. Channels here are `std::sync::mpsc`: a thread-safe queue with one
 //! receiving end, like a `std::queue` guarded by a mutex and condition variable in C++.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -49,6 +50,9 @@ pub enum Job {
     Ignore { repo: Repo, line: String },
     /// Start another program on a file (file manager, default program, "Open with").
     Launch(Launch),
+    /// See which of these folders (the recent repositories) are missing. Done here, not on the UI
+    /// thread, because a folder on a disconnected network drive can take seconds to answer.
+    CheckFolders(Vec<PathBuf>),
 }
 
 /// A program to start on a file.
@@ -124,6 +128,10 @@ pub enum Event {
     /// A program was started, or couldn't be.
     Launched {
         result: Result<(), String>,
+    },
+    /// Which of the checked folders are missing.
+    FoldersChecked {
+        missing: BTreeSet<PathBuf>,
     },
 }
 
@@ -241,6 +249,7 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, wake: Wake) {
                 Event::FilesChanged { repo, result }
             }
             Job::Launch(launch) => Event::Launched { result: start(&launch) },
+            Job::CheckFolders(paths) => Event::FoldersChecked { missing: paths.into_iter().filter(|path| !path.is_dir()).collect() },
         };
         if events.send(event).is_err() {
             break; // The UI has gone away.

@@ -151,6 +151,16 @@ impl RepositoryPrefs {
         self.recent.truncate(MAX_RECENT_REPOSITORIES);
     }
 
+    /// The remembered repositories, newest first (empty entries from a hand-edited file skipped).
+    pub fn paths(&self) -> Vec<PathBuf> {
+        self.recent.iter().filter(|recent| !recent.path.trim().is_empty()).map(|recent| PathBuf::from(&recent.path)).collect()
+    }
+
+    /// Forgets every repository except `keep` (the one open now, which is reopened at startup).
+    pub fn clear_except(&mut self, keep: Option<&Path>) {
+        self.recent.retain(|recent| keep.is_some_and(|keep| recent.is(keep)));
+    }
+
     /// Records the branch shown for `root` (`None` for all branches), if `root` is remembered.
     pub fn set_branch(&mut self, root: &Path, branch: Option<String>) {
         if let Some(recent) = self.recent.iter_mut().find(|recent| recent.is(root)) {
@@ -290,6 +300,23 @@ mod tests {
         }
         assert_eq!(repos.recent.len(), MAX_RECENT_REPOSITORIES);
         assert_eq!(repos.last(), Some(root(&format!("repo{}", MAX_RECENT_REPOSITORIES + 4))));
+    }
+
+    #[test]
+    fn paths_are_newest_first_and_clearing_keeps_the_open_one() {
+        let mut repos = RepositoryPrefs::default();
+        for name in ["a", "b", "c"] {
+            repos.opened(&root(name));
+        }
+        repos.recent.push(RecentRepository { path: "  ".into(), branch: None });
+        assert_eq!(repos.paths(), [root("c"), root("b"), root("a")], "the blank entry is skipped");
+
+        repos.set_branch(&root("b"), Some("refs/heads/x".into()));
+        repos.clear_except(Some(&root("b")));
+        assert_eq!(repos.paths(), [root("b")]);
+        assert_eq!(repos.branch_for(&root("b")), Some("refs/heads/x"), "its branch is kept");
+        repos.clear_except(None);
+        assert!(repos.recent.is_empty());
     }
 
     #[test]

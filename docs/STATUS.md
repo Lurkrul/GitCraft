@@ -168,8 +168,8 @@ exactly like the command line. Submodules as designed (G7).
 | G2 | File checkboxes, summary/description, Commit (Ctrl+Enter), Amend; hook output on failure | done |
 | G2b | Commit tab rows (checkbox, path, letter) and the file right-click menu | done |
 | G3a | Pure patch builder for chosen lines; committing partial files with `git apply --cached` | done |
-| G3b | Pre-staging: ticks saved in `.git/gitcraft/prestage`, surviving restarts | next |
-| G3c | Line and hunk checkboxes in the Commit tab's diff | |
+| G3b | Line and hunk checkboxes in the Commit tab's diff (ticks in memory) | done, not committed |
+| G3c | Pre-staging: ticks saved in `.git/gitcraft/prestage`, surviving restarts | next |
 | G4 | Discard single hunks and lines (whole files are done in G2b) | |
 | G5 | Branches: new, checkout, rename, delete (with confirmations) | |
 | G6 | Repository menu: fetch, pull, push on a second worker; cancel; `--force-with-lease` only | |
@@ -203,8 +203,7 @@ G2 details:
   last message and whether a remote branch already contains HEAD. `status` now also reports the
   branch and whether it has no commits yet (`--branch`).
 - Commit tab: a checkbox per file plus an all/none box (part-filled when mixed). Everything starts
-  ticked; if anything is already staged when files first appear, the ticks follow the index, and a
-  file staged only in part shows a part-filled box and commits exactly its staged part. Ticks
+  ticked (the rule that followed the index when something was staged was removed in G3b). Ticks
   survive refreshes.
 - Message box anchored at the bottom of the left pane: Summary (required), Description, Amend last
   commit, and "Commit to <branch>" (Ctrl+Enter from either box). The button explains on hover why
@@ -245,9 +244,9 @@ The index is only changed when Commit is clicked, so a terminal user's `git comm
 GitCraft's choices. Pre-staging is saved in the repository (`git rev-parse --git-path
 gitcraft/prestage`, so it works in worktrees and submodules too) and survives restarts. It
 records only the exceptions (unticked files and lines); lines are identified by their position in
-the old file and a hash of their text, so unrelated edits don't reset them. Terminal staging only
-sets the starting ticks of files with no entry yet. A file partly staged in a terminal keeps its
-line boxes disabled until the whole file is ticked.
+the old file and a hash of their text, so unrelated edits don't reset them. Anything changed that
+isn't in the pre-stage yet starts ticked; git's index never sets the ticks (changed 2026-11-01:
+the G2 rule that copied the index when something was staged is gone, along with `Tick::AsStaged`).
 
 G3a details:
 - The diff parser keeps git's exact bytes (`FileDiff::source`) next to the readable lines, but only
@@ -263,6 +262,38 @@ G3a details:
 - Every git command now sets `diff.suppressBlankEmpty=false`, so blank context lines keep their
   space whatever the user's config.
 - New `GitError::Unsupported(message)` for things GitCraft can't do in a given case.
+
+G3b details (reordered on request so each step ends with something visible):
+- The Commit tab's diff has a checkbox column: one box per added or removed line, and one per hunk
+  header (part-filled when mixed). Click a line, click a hunk (a fully ticked hunk is unticked,
+  anything else becomes fully ticked), or Shift+click a line to set the range from the last
+  clicked line. The Repository tab's diff has no boxes.
+- A file with some lines left out gets `Tick::Lines` and a part-filled box in the list (hover says
+  so); clicking that box ticks the whole file again. All lines ticked, or none, turns back into a
+  plain ticked or unticked file.
+- Lines are keyed by old-file position and text (`commit_tab/ticks.rs`), so unticked lines stay
+  unticked when the diff is read again after edits elsewhere; a line edited in place stays
+  unticked too. If a file's new diff can't be split any more (binary, too large), it is unticked.
+- The line boxes are disabled (with the reason above the diff) for diffs cut at 20,000 lines and
+  while committing.
+- Commit builds each partial file's patch from the diff its lines were picked on; a choice that
+  can't be a patch shows the reason under the button and commits nothing.
+- `commit_tab.rs` became `commit_tab/{mod.rs, ticks.rs, menu.rs, tests.rs}`. `FileDiff::parse` is
+  now public (used by the app's tests).
+- Block ticking (added on request): a checkbox, full size, in its own column on the first line of each
+  block (a run of added/removed lines with no unchanged line between). Hovering it highlights the
+  block; clicking ticks or unticks it (same rule as hunks). Blocks are computed in `DiffView::new`.
+
+Recent repositories (added on request, alongside G3b):
+- File → Open Recent ▸ lists the remembered repositories (name — full path), newest first; the open
+  one is checked, missing folders are greyed out with "(not found)", then "Clear recent list" (keeps
+  the open repository). With none, a greyed-out "No recent repositories".
+- The toolbar's repository name is now a dropdown with the same list (full path on hover), then
+  "Open other repository…" (the folder picker).
+- Picking one opens it in the background on the Repository tab, with its saved branch.
+- Which folders are missing is checked on the worker thread (a disconnected network drive can stall),
+  when the list changes and when the window gets the focus back. The menu is laid out again only
+  when the list changes.
 
 ## Feature checklist
 
