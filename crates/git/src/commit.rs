@@ -140,6 +140,20 @@ impl Git {
         Ok(())
     }
 
+    /// Applies a patch from [`crate::FileDiff::discard_patch`] to the working tree, throwing away
+    /// the chosen lines' changes. All or nothing: if the file has changed so the patch no longer
+    /// fits, git refuses and nothing is touched. Git's own line-ending and filter settings are
+    /// applied, as for any checkout. The index is not touched.
+    ///
+    /// The changes are gone for good; the app keeps a copy of the file in the Recycle Bin first,
+    /// and asks before calling it.
+    pub fn discard_lines(&self, repo: &Repo, patch: Vec<u8>) -> Result<()> {
+        // `--whitespace=nowarn`: the user's `apply.whitespace` setting must not rewrite or refuse
+        // lines.
+        self.run_with_input(repo.root(), &["apply", "--whitespace=nowarn", "-"], &RunOptions::default(), patch)?;
+        Ok(())
+    }
+
     /// Whether HEAD points at a commit (false on a branch with no commits yet).
     fn has_commits(&self, repo: &Repo) -> Result<bool> {
         // `--verify -q` exits with 1, printing nothing, when HEAD has no commit.

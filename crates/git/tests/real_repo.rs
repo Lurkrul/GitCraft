@@ -768,6 +768,77 @@ fn blank_lines_survive_a_suppress_blank_empty_config() {
     assert_eq!(in_head(&repo, "b.txt"), "a\n\nb\nc");
 }
 
+/// Discards the lines `pick` chooses from `path`'s working diff.
+fn discard(git: &Git, opened: &gitcraft_git::Repo, path: &str, new_file: bool, pick: impl Fn(&str) -> bool) -> gitcraft_git::Result<()> {
+    let diff = git.working_diff(opened, &working(path, new_file)).unwrap();
+    let patch = diff.discard_patch(|at| pick(&diff.hunks[at.hunk].lines[at.line].text)).unwrap().expect("something picked");
+    git.discard_lines(opened, patch)
+}
+
+#[test]
+fn discarding_lines_reverts_only_those_lines() {
+    let repo = TestRepo::new();
+    write(&repo, "f.txt", &numbered_lines());
+    repo.git(&["add", "."]);
+    repo.commit("Root");
+    write(&repo, "f.txt", &numbered_with(&[(2, "two"), (6, "6\nsix and a half"), (11, "eleven")]));
+    repo.git(&["add", "f.txt"]); // staged too: the index must be left alone
+
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    discard(&git, &opened, "f.txt", false, |text| text == "eleven" || text == "11").unwrap();
+    let on_disk = std::fs::read_to_string(repo.path().join("f.txt")).unwrap();
+    assert_eq!(on_disk, numbered_with(&[(2, "two"), (6, "6\nsix and a half")]), "only line 11 went back");
+    assert!(repo.git(&["diff", "--cached"]).contains("+eleven"), "the index is untouched");
+
+    // Just the added line, keeping its neighbours' changes.
+    discard(&git, &opened, "f.txt", false, |text| text == "six and a half").unwrap();
+    assert_eq!(std::fs::read_to_string(repo.path().join("f.txt")).unwrap(), numbered_with(&[(2, "two")]));
+}
+
+#[test]
+fn discarding_lines_works_with_autocrlf_files() {
+    let repo = TestRepo::new();
+    repo.git(&["config", "core.autocrlf", "true"]);
+    write(&repo, "w.txt", "a\r\nb\r\nc\r\n");
+    repo.git(&["add", "."]);
+    repo.commit("Root");
+    write(&repo, "w.txt", "a\r\nB\r\nc\r\nd\r\n");
+
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    discard(&git, &opened, "w.txt", false, |text| text == "d").unwrap();
+    assert_eq!(std::fs::read(repo.path().join("w.txt")).unwrap(), b"a\r\nB\r\nc\r\n", "line endings kept");
+}
+
+#[test]
+fn discarding_lines_of_an_untracked_file() {
+    let repo = TestRepo::new();
+    repo.commit("Root");
+    write(&repo, "new.txt", "keep\ndrop\nkeep too\n");
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    discard(&git, &opened, "new.txt", true, |text| text == "drop").unwrap();
+    assert_eq!(std::fs::read_to_string(repo.path().join("new.txt")).unwrap(), "keep\nkeep too\n");
+}
+
+#[test]
+fn a_discard_patch_that_no_longer_fits_changes_nothing() {
+    let repo = TestRepo::new();
+    write(&repo, "f.txt", &numbered_lines());
+    repo.git(&["add", "."]);
+    repo.commit("Root");
+    write(&repo, "f.txt", &numbered_with(&[(5, "five")]));
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    let diff = git.working_diff(&opened, &working("f.txt", false)).unwrap();
+    let patch = diff.discard_patch(|_| true).unwrap().unwrap();
+    // The file changes again before the discard runs.
+    write(&repo, "f.txt", &numbered_with(&[(5, "FIVE!")]));
+    assert!(git.discard_lines(&opened, patch).is_err());
+    assert_eq!(std::fs::read_to_string(repo.path().join("f.txt")).unwrap(), numbered_with(&[(5, "FIVE!")]), "untouched");
+}
+
 #[test]
 fn a_path_listed_twice_is_refused() {
     let repo = TestRepo::new();

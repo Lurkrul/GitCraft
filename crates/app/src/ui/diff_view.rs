@@ -105,6 +105,26 @@ pub struct Ticks<'a> {
     pub disabled_reason: &'a str,
     /// Whether an added or removed line is ticked.
     pub is_ticked: &'a dyn Fn(LineRef) -> bool,
+    /// Right-clicking a box offers to discard its lines (not for a deleted file, say).
+    pub can_discard: bool,
+}
+
+/// What the user did with a checkbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffAction {
+    /// Clicked it.
+    Tick(TickClick),
+    /// Chose "Discard …" from its right-click menu: throw away the changes of these lines.
+    Discard(TickTarget),
+}
+
+/// The right-click menu's label for a box.
+fn discard_label(target: TickTarget, kind: Option<LineKind>) -> &'static str {
+    match (target, kind) {
+        (TickTarget::Line(_), Some(LineKind::Added)) => "Discard added line",
+        (TickTarget::Line(_), Some(LineKind::Removed)) => "Discard removed line",
+        _ => "Discard lines",
+    }
 }
 
 /// A click on a checkbox.
@@ -174,7 +194,7 @@ pub fn show(
     state: &DiffState,
     scroll_key: impl std::hash::Hash + std::fmt::Debug,
     ticks: Option<&Ticks<'_>>,
-) -> Option<TickClick> {
+) -> Option<DiffAction> {
     match state {
         DiffState::Empty => {
             ui.centered_and_justified(|ui| {
@@ -205,7 +225,7 @@ pub fn show(
     None
 }
 
-fn lines(ui: &mut egui::Ui, view: &DiffView, scroll_key: impl std::hash::Hash + std::fmt::Debug, ticks: Option<&Ticks<'_>>) -> Option<TickClick> {
+fn lines(ui: &mut egui::Ui, view: &DiffView, scroll_key: impl std::hash::Hash + std::fmt::Debug, ticks: Option<&Ticks<'_>>) -> Option<DiffAction> {
     if view.diff.truncated {
         ui.weak(format!("Showing the first {MAX_DIFF_LINES} lines of this file's changes."));
     }
@@ -273,8 +293,12 @@ fn lines(ui: &mut egui::Ui, view: &DiffView, scroll_key: impl std::hash::Hash + 
                     }
                     let state = lines_state(block.lines.iter().copied(), ticks.is_ticked);
                     paint_box(ui, box_rect, state, ticks.enabled, response.hovered());
+                    let target = TickTarget::Block(*block_index);
                     if response.clicked() {
-                        clicked = Some(TickClick { target: TickTarget::Block(*block_index), shift: false });
+                        clicked = Some(DiffAction::Tick(TickClick { target, shift: false }));
+                    }
+                    if let Some(discard) = discard_menu(&response, ticks, target, None) {
+                        clicked = Some(discard);
                     }
                 }
                 if hovered_block == Some(*block_index) {
@@ -305,7 +329,14 @@ fn lines(ui: &mut egui::Ui, view: &DiffView, scroll_key: impl std::hash::Hash + 
                     };
                     paint_box(ui, box_rect, state, ticks.enabled, response.hovered());
                     if response.clicked() {
-                        clicked = Some(TickClick { target, shift: ui.input(|input| input.modifiers.shift) });
+                        clicked = Some(DiffAction::Tick(TickClick { target, shift: ui.input(|input| input.modifiers.shift) }));
+                    }
+                    let kind = match row {
+                        DiffRow::Line { kind, .. } => Some(*kind),
+                        DiffRow::Hunk { .. } => None,
+                    };
+                    if let Some(discard) = discard_menu(&response, ticks, target, kind) {
+                        clicked = Some(discard);
                     }
                 }
             }
@@ -339,6 +370,21 @@ fn lines(ui: &mut egui::Ui, view: &DiffView, scroll_key: impl std::hash::Hash + 
         }
     });
     clicked
+}
+
+/// The right-click menu of a checkbox, when discarding is allowed; returns the choice.
+fn discard_menu(response: &egui::Response, ticks: &Ticks<'_>, target: TickTarget, kind: Option<LineKind>) -> Option<DiffAction> {
+    if !ticks.enabled || !ticks.can_discard {
+        return None;
+    }
+    let mut chosen = None;
+    response.context_menu(|ui| {
+        if ui.button(discard_label(target, kind)).clicked() {
+            ui.close();
+            chosen = Some(DiffAction::Discard(target));
+        }
+    });
+    chosen
 }
 
 /// Draws a checkbox: a rounded square, with a tick when ticked or a bar when part-filled. (Drawn by
@@ -437,6 +483,15 @@ mod tests {
     }
 
     #[test]
+    fn discard_menu_labels_name_what_goes() {
+        let at = LineRef { hunk: 0, line: 1 };
+        assert_eq!(discard_label(TickTarget::Line(at), Some(LineKind::Added)), "Discard added line");
+        assert_eq!(discard_label(TickTarget::Line(at), Some(LineKind::Removed)), "Discard removed line");
+        assert_eq!(discard_label(TickTarget::Block(0), None), "Discard lines");
+        assert_eq!(discard_label(TickTarget::Hunk(0), None), "Discard lines");
+    }
+
+    #[test]
     fn hunk_boxes_sum_up_their_lines() {
         let diff = sample();
         assert_eq!(hunk_state(&diff, 0, &|_| true), BoxState::Ticked);
@@ -458,7 +513,7 @@ mod tests {
         for events in frames {
             let input = egui::RawInput { events, ..egui::RawInput::default() };
             let mut output = ctx.run_ui(input, |ui| {
-                if let Some(click) = show(ui, state, "key", Some(ticks)) {
+                if let Some(DiffAction::Tick(click)) = show(ui, state, "key", Some(ticks)) {
                     result = Some(click);
                 }
             });
@@ -528,13 +583,13 @@ mod tests {
     fn clicking_a_block_box_reports_its_block() {
         let state = DiffState::Loaded(Box::new(DiffView::new(two_blocks())));
         let is_ticked = |_: LineRef| true;
-        let ticks = Ticks { enabled: true, disabled_reason: "", is_ticked: &is_ticked };
+        let ticks = Ticks { enabled: true, disabled_reason: "", is_ticked: &is_ticked, can_discard: true };
         // Row 1 is the first line of the first block, row 4 of the second.
         assert_eq!(click(&state, &ticks, block_box_center(1), false), Some(TickClick { target: TickTarget::Block(0), shift: false }));
         assert_eq!(click(&state, &ticks, block_box_center(4), false), Some(TickClick { target: TickTarget::Block(1), shift: false }));
         assert_eq!(click(&state, &ticks, block_box_center(2), false), None, "only the block's first line has the box");
         assert_eq!(click(&state, &ticks, block_box_center(3), false), None, "no box beside an unchanged line");
-        let disabled = Ticks { enabled: false, disabled_reason: "why", is_ticked: &is_ticked };
+        let disabled = Ticks { enabled: false, disabled_reason: "why", is_ticked: &is_ticked, can_discard: true };
         assert_eq!(click(&state, &disabled, block_box_center(1), false), None);
     }
 
@@ -542,7 +597,7 @@ mod tests {
     fn clicking_boxes_reports_the_line_or_hunk() {
         let state = DiffState::Loaded(Box::new(DiffView::new(sample())));
         let is_ticked = |_: LineRef| true;
-        let ticks = Ticks { enabled: true, disabled_reason: "", is_ticked: &is_ticked };
+        let ticks = Ticks { enabled: true, disabled_reason: "", is_ticked: &is_ticked, can_discard: true };
         // Row 0 is the hunk header, row 1 context (no box), row 2 the removed line.
         assert_eq!(click(&state, &ticks, box_center(0), false), Some(TickClick { target: TickTarget::Hunk(0), shift: false }));
         assert_eq!(click(&state, &ticks, box_center(1), false), None, "context lines have no box");
@@ -551,7 +606,7 @@ mod tests {
             Some(TickClick { target: TickTarget::Line(LineRef { hunk: 0, line: 1 }), shift: true })
         );
 
-        let disabled = Ticks { enabled: false, disabled_reason: "why", is_ticked: &is_ticked };
+        let disabled = Ticks { enabled: false, disabled_reason: "why", is_ticked: &is_ticked, can_discard: true };
         assert_eq!(click(&state, &disabled, box_center(2), false), None, "disabled boxes ignore clicks");
     }
 
@@ -576,7 +631,7 @@ mod tests {
         ];
         let ctx = egui::Context::default();
         let is_ticked = |at: LineRef| at.line == 1;
-        let ticks = Ticks { enabled: true, disabled_reason: "", is_ticked: &is_ticked };
+        let ticks = Ticks { enabled: true, disabled_reason: "", is_ticked: &is_ticked, can_discard: true };
         for state in &states {
             for with_ticks in [None, Some(&ticks)] {
                 let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {

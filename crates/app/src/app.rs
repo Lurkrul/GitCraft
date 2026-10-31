@@ -147,6 +147,8 @@ enum Pending {
     AmendPushed(Confirm),
     /// Discarding a file's changes.
     Discard { path: String, tracked: bool, question: Confirm },
+    /// Discarding some lines of a file.
+    DiscardLines { path: String, patch: Vec<u8>, question: Confirm },
 }
 
 impl GitCraftApp {
@@ -728,6 +730,10 @@ impl GitCraftApp {
             Some(Picked::Commit(commit_tab::Action::Commit)) => self.start_commit(false),
             Some(Picked::Commit(commit_tab::Action::AmendTurnedOn)) => self.turn_on_amend(),
             Some(Picked::Commit(commit_tab::Action::File { path, command })) => self.run_file_command(ui.ctx(), path, command),
+            Some(Picked::Commit(commit_tab::Action::DiscardLines { path, patch, question })) => {
+                self.confirm = Some(Pending::DiscardLines { path, patch, question });
+            }
+            Some(Picked::Commit(commit_tab::Action::Problem(message))) => self.error = Some(message),
             Some(Picked::Repository(repository::Pick::Commit(id))) => {
                 // A parent link: select it, and bring it into view if it is in the list.
                 self.select_commit(id);
@@ -744,7 +750,7 @@ impl GitCraftApp {
     /// Shows the pending question, if any, and acts on the answer.
     fn show_confirmation(&mut self, ctx: &egui::Context) {
         let question = match &self.confirm {
-            Some(Pending::AmendPushed(question) | Pending::Discard { question, .. }) => question,
+            Some(Pending::AmendPushed(question) | Pending::Discard { question, .. } | Pending::DiscardLines { question, .. }) => question,
             None => return,
         };
         match confirm::show(ctx, question) {
@@ -762,6 +768,12 @@ impl GitCraftApp {
             Some(Pending::Discard { path, tracked, .. }) => {
                 if let Some(open) = &self.open {
                     let job = Job::Discard { repo: open.repo.clone(), path, tracked };
+                    self.send(job);
+                }
+            }
+            Some(Pending::DiscardLines { path, patch, .. }) => {
+                if let Some(open) = &self.open {
+                    let job = Job::DiscardLines { repo: open.repo.clone(), path, patch };
                     self.send(job);
                 }
             }
@@ -1890,6 +1902,42 @@ mod tests {
         let committed: String = (1..=12).map(|n| if n == 2 { "two\n".to_string() } else { format!("{n}\n") }).collect();
         assert_eq!(repo.git(&["show", "HEAD:f.txt"]) + "\n", committed);
         assert_eq!(repo.git(&["show", "HEAD:other.txt"]), "o", "the unticked file wasn't committed");
+    }
+
+    #[test]
+    fn discarding_a_hunk_asks_first_then_reverts_only_it() {
+        let repo = TestRepo::with_commits(&[]);
+        let lines: String = (1..=12).map(|n| format!("{n}\n")).collect();
+        repo.commit_files(&[("f.txt", &lines)], "Root");
+        let edited: String = (1..=12)
+            .map(|n| match n {
+                2 => "two\n".to_string(),
+                11 => "eleven\n".to_string(),
+                _ => format!("{n}\n"),
+            })
+            .collect();
+        std::fs::write(repo.path().join("f.txt"), &edited).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.tab = MainTab::Commit;
+        settle(&mut app, &ctx);
+
+        // Right-click the second hunk's box → "Discard lines".
+        let Some(commit_tab::Action::DiscardLines { path, patch, question }) = changes(&mut app).discard_action(diff_view::TickTarget::Hunk(1))
+        else {
+            panic!("a discard to confirm");
+        };
+        assert!(question.body.contains("f.txt") && question.body.contains(files::TRASH_NAME), "{}", question.body);
+        app.confirm = Some(Pending::DiscardLines { path, patch, question });
+        assert_eq!(std::fs::read_to_string(repo.path().join("f.txt")).unwrap(), edited, "nothing happens before the answer");
+
+        app.run_pending();
+        settle(&mut app, &ctx);
+        let expected: String = (1..=12).map(|n| if n == 2 { "two\n".to_string() } else { format!("{n}\n") }).collect();
+        assert_eq!(std::fs::read_to_string(repo.path().join("f.txt")).unwrap(), expected, "only the second hunk went back");
+        assert_eq!(changed_paths(&app), ["f.txt"], "the first change is still there");
+        assert!(matches!(app.status_line(), StatusLine::Info(_)), "no error");
     }
 
     #[test]

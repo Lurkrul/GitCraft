@@ -51,6 +51,9 @@ pub enum Job {
     /// Throw away a changed file's changes: the file goes to the Recycle Bin first, then (if git
     /// tracks it) the committed version is restored.
     Discard { repo: Repo, path: String, tracked: bool },
+    /// Throw away some lines' changes: a copy of the file goes to the Recycle Bin first, then the
+    /// patch (from `FileDiff::discard_patch`) is applied to the working tree.
+    DiscardLines { repo: Repo, path: String, patch: Vec<u8> },
     /// Add a line to the repository's `.gitignore`.
     Ignore { repo: Repo, line: String },
     /// Start another program on a file (file manager, default program, "Open with").
@@ -304,6 +307,10 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, wake: Wake) {
                 let result = discard(&mut git, &repo, &path, tracked);
                 Event::FilesChanged { repo, result }
             }
+            Job::DiscardLines { repo, path, patch } => {
+                let result = discard_lines(&mut git, &repo, &path, patch);
+                Event::FilesChanged { repo, result }
+            }
             Job::Ignore { repo, line } => {
                 let result = files::add_to_gitignore(repo.root(), &line).map(|_| ()).map_err(|error| format!("Could not update .gitignore: {error}"));
                 Event::FilesChanged { repo, result }
@@ -337,6 +344,16 @@ fn commit(git: &Git, repo: &Repo, plan: CommitPlan) -> Result<String, GitError> 
         }
     }
     git.commit(repo, &request)
+}
+
+/// Discards some lines of one file. A copy of the file goes to the Recycle Bin first; if that
+/// fails, nothing is changed.
+fn discard_lines(git: &mut Option<Git>, repo: &Repo, path: &str, patch: Vec<u8>) -> Result<(), String> {
+    let git = located(git).map_err(|error| error.to_string())?;
+    let full = files::full_path(repo.root(), path);
+    files::copy_to_trash(&full)
+        .map_err(|error| format!("Could not put a copy of {path} in the {}, so nothing was changed: {error}", files::TRASH_NAME))?;
+    git.discard_lines(repo, patch).map_err(|error| format!("Could not discard the lines in {path} (the file may have changed meanwhile): {error}"))
 }
 
 /// Discards one file's changes. The file on disk goes to the Recycle Bin first; if that fails,

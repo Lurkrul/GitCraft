@@ -335,6 +335,37 @@ fn a_diff_that_can_no_longer_be_split_leaves_the_file_out() {
     assert!(changes.partial.is_empty());
 }
 
+// --- Discarding lines ---
+
+#[test]
+fn discarding_a_line_block_or_hunk_asks_with_a_patch() {
+    let changes = with_diff(TWO_BLOCKS);
+    let Some(Action::DiscardLines { path, patch, question }) = changes.discard_action(TickTarget::Line(line(0, 2))) else {
+        panic!("a discard to confirm");
+    };
+    assert_eq!(path, "a.txt");
+    assert!(question.body.contains("1 added line in \"a.txt\""), "{}", question.body);
+    let patch = String::from_utf8(patch).unwrap();
+    // Only that line is taken out; the other changes appear as unchanged context.
+    assert!(patch.contains("-TWO") && !patch.contains("-FOUR") && patch.contains(" FOUR"), "only that line: {patch}");
+
+    let Some(Action::DiscardLines { question, .. }) = changes.discard_action(TickTarget::Block(1)) else { panic!("block") };
+    assert!(question.body.contains("2 added lines and 1 removed line"), "{}", question.body);
+    let Some(Action::DiscardLines { question, .. }) = changes.discard_action(TickTarget::Hunk(0)) else { panic!("hunk") };
+    assert!(question.body.contains("3 added lines and 2 removed lines"), "{}", question.body);
+    assert_eq!(changes.discard_action(TickTarget::Block(9)), None, "no such block");
+}
+
+#[test]
+fn a_discard_that_cant_be_a_patch_is_reported() {
+    let patch = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,2 @@\n-last\n\\ No newline at end of file\n+last\n+more\n";
+    let changes = with_diff(patch);
+    match changes.discard_action(TickTarget::Line(line(0, 0))) {
+        Some(Action::Problem(message)) => assert!(message.contains("discarded together"), "{message}"),
+        other => panic!("expected a problem, got {other:?}"),
+    }
+}
+
 // --- Pre-staging (saving the ticks) ---
 
 #[test]

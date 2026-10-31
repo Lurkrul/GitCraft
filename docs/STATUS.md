@@ -169,9 +169,9 @@ exactly like the command line. Submodules as designed (G7).
 | G2b | Commit tab rows (checkbox, path, letter) and the file right-click menu | done |
 | G3a | Pure patch builder for chosen lines; committing partial files with `git apply --cached` | done |
 | G3b | Line and hunk checkboxes in the Commit tab's diff (ticks in memory) | done (`86291a9`) |
-| G3c | Pre-staging: ticks saved in `.git/gitcraft/prestage`, surviving restarts | done, not committed |
-| G4 | Discard single hunks and lines (whole files are done in G2b) | |
-| G5 | Branches: new, checkout, rename, delete (with confirmations) | |
+| G3c | Pre-staging: ticks saved in `.git/gitcraft/prestage`, surviving restarts | done (`ac4b603`) |
+| G4 | Discard single hunks, blocks and lines (whole files are done in G2b) | done, not committed |
+| G5 | Branches: new, checkout, rename, delete (with confirmations) | next |
 | G6 | Repository menu: fetch, pull, push on a second worker; cancel; `--force-with-lease` only | |
 | G7 | Submodules: Repository → Submodules menu, list, open with breadcrumb, Commit tab entries | |
 
@@ -313,6 +313,19 @@ G3c details:
   file's diff again, moves the picks onto it and builds the patch (so picks restored from the file
   work without opening the diff first). After a successful commit, partly committed files become
   fully unticked: what is left of them is what was left out.
+
+G4 details:
+- Right-click a checkbox in the Commit tab's diff: a line's box offers "Discard added line" or
+  "Discard removed line", a block's or hunk's box "Discard lines". (Whole files: "Discard changes…" in
+  the file list's right-click menu, from G2b.) Not offered for deleted files, or while the boxes are
+  disabled (cut-short diffs, committing).
+- A confirmation counts the added and removed lines that will be lost. Then a copy of the file goes
+  to the Recycle Bin (`files::copy_to_trash`; if that fails nothing changes), and the patch is applied.
+- Git layer: `FileDiff::discard_patch` mirrors `partial_patch` against the working file (chosen added
+  lines removed, chosen removed lines put back, other changes untouched; one shared hunk builder with a
+  direction). `Git::discard_lines` runs `git apply --whitespace=nowarn` on the working tree: all or
+  nothing, with git's line-ending and filter handling (tested with `core.autocrlf=true`); the index is
+  not touched. A patch that no longer fits (the file changed) is refused and nothing changes.
 
 ## Feature checklist
 

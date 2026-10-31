@@ -125,6 +125,18 @@ your own.
 - [ ] A file whose old last line had no newline: ticking only the new line after it gives a clear
       message under the Commit button, and nothing is committed.
 
+## Commit tab: discarding lines
+
+- [ ] Right-click a line's checkbox in the diff: "Discard added line" (or "Discard removed line").
+      Right-click a block's or hunk's checkbox: "Discard lines".
+- [ ] Choosing it asks first, saying how many added and removed lines will be lost; Cancel or Esc
+      changes nothing.
+- [ ] Confirming reverts only those lines: other changes in the file stay, and the list and diff
+      refresh. A copy of the file before the discard is in the Recycle Bin.
+- [ ] Discarding a removed line puts it back; discarding an added line takes it out.
+- [ ] Works on a new (untracked) file, and on a file with Windows (CRLF) line endings.
+- [ ] A deleted file's boxes offer no discard (use "Discard changes…" on the file).
+
 ## Commit tab: pre-staging (ticks saved)
 
 - [ ] Untick a file, close GitCraft and open it again: the file is still unticked.

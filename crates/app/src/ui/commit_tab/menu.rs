@@ -95,6 +95,23 @@ pub fn discard_question(entry: &StatusEntry) -> Confirm {
     Confirm { title: "Discard changes?".into(), body, action: "Discard changes".into() }
 }
 
+/// The confirmation shown before discarding some lines of a file: how many added and removed lines,
+/// and what happens to them.
+pub fn discard_lines_question(path: &str, added: usize, removed: usize) -> Confirm {
+    let count = |n: usize, what: &str| format!("{n} {what} line{}", if n == 1 { "" } else { "s" });
+    let what = match (added, removed) {
+        (0, removed) => count(removed, "removed"),
+        (added, 0) => count(added, "added"),
+        (added, removed) => format!("{} and {}", count(added, "added"), count(removed, "removed")),
+    };
+    let body = format!(
+        "The changes of {what} in \"{path}\" will be lost: added lines are taken out and removed lines put back, as in the last \
+         commit. The file's other changes stay. A copy of the current file goes to the {} first, so you can get it back from there.",
+        files::TRASH_NAME
+    );
+    Confirm { title: "Discard lines?".into(), body, action: "Discard lines".into() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +134,15 @@ mod tests {
         let deleted = discard_question(&entry("d.txt", EntryKind::Tracked, Change::Unmodified, Change::Deleted));
         assert!(deleted.body.contains("brings back"), "{}", deleted.body);
         assert_eq!(edited.action, "Discard changes");
+    }
+
+    #[test]
+    fn discard_lines_questions_count_what_goes() {
+        assert!(discard_lines_question("a.txt", 1, 0).body.contains("1 added line in \"a.txt\""));
+        assert!(discard_lines_question("a.txt", 0, 3).body.contains("3 removed lines"));
+        let both = discard_lines_question("a.txt", 2, 1);
+        assert!(both.body.contains("2 added lines and 1 removed line") && both.body.contains(files::TRASH_NAME), "{}", both.body);
+        assert_eq!(both.action, "Discard lines");
     }
 
     #[test]

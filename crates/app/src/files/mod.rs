@@ -113,6 +113,26 @@ pub fn move_to_trash(path: &Path) -> Result<(), String> {
     trash_impl(path)
 }
 
+/// Puts a copy of the file in the Recycle Bin / Trash and leaves the file itself where it is: the
+/// safety net before part of it is thrown away. The copy keeps the file's name, so it is easy to
+/// find there.
+pub fn copy_to_trash(path: &Path) -> Result<(), String> {
+    let name = path.file_name().ok_or("the file has no name")?;
+    let unique = format!(
+        "gitcraft-copy-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    );
+    let folder = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
+    let copy = folder.join(name);
+    let result = std::fs::copy(path, &copy).map_err(|error| error.to_string()).and_then(|_| move_to_trash(&copy));
+    // Whatever happened, the scratch folder goes (the copy is in the bin, or wasn't made).
+    let _ = std::fs::remove_file(&copy);
+    let _ = std::fs::remove_dir(&folder);
+    result
+}
+
 #[cfg(not(test))]
 fn trash_impl(path: &Path) -> Result<(), String> {
     trash::delete(path).map_err(|error| error.to_string())

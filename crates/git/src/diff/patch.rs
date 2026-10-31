@@ -1,4 +1,5 @@
-//! Building a patch of chosen lines, for committing part of a file (`git apply --cached`).
+//! Building a patch of chosen lines: for committing part of a file (`git apply --cached`), or for
+//! discarding part of it (`git apply` on the working tree).
 //!
 //! The diff is HEAD → working tree. The patch applies to HEAD's version of the file and takes only
 //! the chosen changes, the same way GitHub Desktop does it:
@@ -35,6 +36,16 @@ struct Ended {
     new: bool,
 }
 
+/// Which way a patch goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// HEAD's version → HEAD's version plus the chosen changes (for `git apply --cached`).
+    Commit,
+    /// The working file → the working file without the chosen changes (for `git apply` on the
+    /// working tree).
+    Discard,
+}
+
 impl FileDiff {
     /// A patch with only the added and removed lines `selected` says yes to (it is asked only about
     /// those). Returns `None` when nothing is chosen.
@@ -43,10 +54,41 @@ impl FileDiff {
     /// choice can't be written as a valid patch: when a file's last line has no newline, its
     /// removed and added versions have to be chosen together.
     pub fn partial_patch(&self, selected: impl Fn(LineRef) -> bool) -> Result<Option<Vec<u8>>> {
-        let source = self.source.as_ref().ok_or_else(|| {
-            GitError::Unsupported("Single lines can't be picked in this file's changes (a binary file, or too many changes to show).".into())
-        })?;
+        let source = self.pickable()?;
+        let Some((hunks, keeps_lines)) = self.build_hunks(source, &selected, Direction::Commit)? else {
+            return Ok(None);
+        };
+        let mut patch = file_header(source, keeps_lines)?;
+        patch.extend_from_slice(&hunks);
+        Ok(Some(patch))
+    }
 
+    /// A patch that takes the chosen changes back out of the working file, for `git apply` on the
+    /// working tree: a chosen added line is removed, a chosen removed line is put back, and every
+    /// other change stays as it is. Returns `None` when nothing is chosen.
+    ///
+    /// Fails like [`FileDiff::partial_patch`], and for a deleted file (there is no file on disk to
+    /// edit: discard the whole file instead).
+    pub fn discard_patch(&self, selected: impl Fn(LineRef) -> bool) -> Result<Option<Vec<u8>>> {
+        let source = self.pickable()?;
+        let Some((hunks, _)) = self.build_hunks(source, &selected, Direction::Discard)? else {
+            return Ok(None);
+        };
+        let mut patch = working_file_header(source)?;
+        patch.extend_from_slice(&hunks);
+        Ok(Some(patch))
+    }
+
+    fn pickable(&self) -> Result<&PatchSource> {
+        self.source.as_ref().ok_or_else(|| {
+            GitError::Unsupported("Single lines can't be picked in this file's changes (a binary file, or too many changes to show).".into())
+        })
+    }
+
+    /// The hunks of a patch in `direction`, and whether the resulting file keeps any lines; `None`
+    /// when no line is chosen. "Old" and "new" below are the patch's own sides: for a commit HEAD's
+    /// version and the result, for a discard the working file and the result.
+    fn build_hunks(&self, source: &PatchSource, selected: &dyn Fn(LineRef) -> bool, direction: Direction) -> Result<Option<(Vec<u8>, bool)>> {
         let mut hunks_out = Vec::new();
         // How many more lines the new file has than the old one, before the current hunk.
         let mut delta: i64 = 0;
@@ -63,26 +105,32 @@ impl FileDiff {
 
             for (line_index, (line, range)) in hunk.lines.iter().zip(&source_hunk.lines).enumerate() {
                 let raw = raw_line(&source.bytes, range);
-                let chosen = || selected(LineRef { hunk: hunk_index, line: line_index });
-                let kept = match line.kind {
-                    LineKind::NoNewline => {
-                        // The marker belongs to the line before; it goes wherever that line went.
-                        if let Some(kept) = previous {
-                            push_line(&mut body, raw);
-                            match kept {
-                                Kept::Context => (ended.old, ended.new) = (true, true),
-                                Kept::Removed => ended.old = true,
-                                Kept::Added => ended.new = true,
-                            }
+                if line.kind == LineKind::NoNewline {
+                    // The marker belongs to the line before; it goes wherever that line went.
+                    if let Some(kept) = previous {
+                        push_line(&mut body, raw);
+                        match kept {
+                            Kept::Context => (ended.old, ended.new) = (true, true),
+                            Kept::Removed => ended.old = true,
+                            Kept::Added => ended.new = true,
                         }
-                        continue;
                     }
-                    LineKind::Context => Some(Kept::Context),
-                    LineKind::Removed if chosen() => Some(Kept::Removed),
-                    // An unchosen removal stays in the file: it becomes context.
-                    LineKind::Removed => Some(Kept::Context),
-                    LineKind::Added if chosen() => Some(Kept::Added),
-                    LineKind::Added => None,
+                    continue;
+                }
+                let chosen = matches!(line.kind, LineKind::Added | LineKind::Removed) && selected(LineRef { hunk: hunk_index, line: line_index });
+                let kept = match (direction, line.kind, chosen) {
+                    (_, LineKind::Context | LineKind::NoNewline, _) => Some(Kept::Context),
+                    // Committing works on HEAD's version, where removed lines still are.
+                    (Direction::Commit, LineKind::Removed, true) => Some(Kept::Removed),
+                    (Direction::Commit, LineKind::Removed, false) => Some(Kept::Context), // stays in the file
+                    (Direction::Commit, LineKind::Added, true) => Some(Kept::Added),
+                    (Direction::Commit, LineKind::Added, false) => None, // left out
+                    // Discarding works on the working file, where added lines are and removed
+                    // lines aren't.
+                    (Direction::Discard, LineKind::Added, true) => Some(Kept::Removed), // taken out
+                    (Direction::Discard, LineKind::Added, false) => Some(Kept::Context), // stays
+                    (Direction::Discard, LineKind::Removed, true) => Some(Kept::Added), // put back
+                    (Direction::Discard, LineKind::Removed, false) => None,             // stays gone
                 };
                 previous = kept;
                 let Some(kept) = kept else { continue };
@@ -93,33 +141,34 @@ impl FileDiff {
                     Kept::Added => ended.new,
                 };
                 if side_ended {
-                    return Err(GitError::Unsupported(
-                        "The file's last line has no newline at the end, so its removed and added versions must be ticked together.".into(),
-                    ));
+                    let verb = match direction {
+                        Direction::Commit => "ticked",
+                        Direction::Discard => "discarded",
+                    };
+                    return Err(GitError::Unsupported(format!(
+                        "The file's last line has no newline at the end, so its removed and added versions must be {verb} together."
+                    )));
                 }
-                match kept {
+                // The line's text with the marker of what it became (' ', '-' or '+').
+                let marker = match kept {
                     Kept::Context => {
                         old_count += 1;
                         new_count += 1;
-                        if line.kind == LineKind::Removed {
-                            // Same text, with ' ' in place of '-'.
-                            body.push(b' ');
-                            push_line(&mut body, raw.get(1..).unwrap_or_default());
-                        } else {
-                            push_line(&mut body, raw);
-                        }
+                        b' '
                     }
                     Kept::Removed => {
                         old_count += 1;
                         changed = true;
-                        push_line(&mut body, raw);
+                        b'-'
                     }
                     Kept::Added => {
                         new_count += 1;
                         changed = true;
-                        push_line(&mut body, raw);
+                        b'+'
                     }
-                }
+                };
+                body.push(marker);
+                push_line(&mut body, raw.get(1..).unwrap_or_default());
             }
 
             keeps_lines |= new_count > 0;
@@ -128,7 +177,11 @@ impl FileDiff {
             }
             // Where the hunk starts in the new file. A count of 0 means the start is the line
             // *before* the (empty) range, as in "@@ -5,0 +6,2 @@".
-            let old_start = i64::from(source_hunk.header.old_start);
+            let old_start = i64::from(match direction {
+                Direction::Commit => source_hunk.header.old_start,
+                // The working file is the diff's new side.
+                Direction::Discard => source_hunk.header.new_start,
+            });
             let first_old = if old_count == 0 { old_start + 1 } else { old_start };
             let first_new = first_old + delta;
             let new_start = if new_count == 0 { first_new - 1 } else { first_new }.max(0);
@@ -137,13 +190,35 @@ impl FileDiff {
             delta += i64::from(new_count) - i64::from(old_count);
         }
 
-        if hunks_out.is_empty() {
-            return Ok(None);
-        }
-        let mut patch = file_header(source, keeps_lines)?;
-        patch.extend_from_slice(&hunks_out);
-        Ok(Some(patch))
+        Ok((!hunks_out.is_empty()).then_some((hunks_out, keeps_lines)))
     }
+}
+
+/// The header of a patch on the working file: the file's name (from the diff's `+++` line) on both
+/// sides, with no mode lines, so it reads as an ordinary edit even for a new, untracked file.
+fn working_file_header(source: &PatchSource) -> Result<Vec<u8>> {
+    let header = source.bytes.get(source.header.clone()).unwrap_or_default();
+    let new_name = header
+        .split_inclusive(|&byte| byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"+++ "))
+        .map(|name| name.strip_suffix(b"\n").unwrap_or(name))
+        .map(|name| name.strip_suffix(b"\r").unwrap_or(name))
+        .unwrap_or_default();
+    if new_name == b"/dev/null" {
+        return Err(GitError::Unsupported("This file was deleted, so there are no lines on disk to discard. Discard the whole file instead.".into()));
+    }
+    let old_name = if let Some(rest) = new_name.strip_prefix(b"b/") {
+        [b"a/".as_slice(), rest].concat()
+    } else if let Some(rest) = new_name.strip_prefix(b"\"b/") {
+        [b"\"a/".as_slice(), rest].concat()
+    } else {
+        return Err(GitError::Malformed { what: "diff header".into(), detail: "the file's name has an unexpected form".into() });
+    };
+    let mut out = Vec::new();
+    for part in [b"diff --git ".as_slice(), &old_name, b" ", new_name, b"\n--- ", &old_name, b"\n+++ ", new_name, b"\n"] {
+        out.extend_from_slice(part);
+    }
+    Ok(out)
 }
 
 /// Appends a line, making sure it ends with a newline (git's output always does, but the last line
@@ -331,6 +406,67 @@ mod tests {
         let body = "@@ -1 +1 @@\n-a\n+b\n\\ No newline at end of file\n";
         let out = hunks(diff(body).partial_patch(only(&[(0, 0)])).unwrap());
         assert_eq!(out, "@@ -1,1 +0,0 @@\n-a\n");
+    }
+
+    // --- Discarding (a patch on the working file) ---
+
+    /// The discard patch's text after its header, checking the header names the file on both sides.
+    fn discard_hunks(patch: Option<Vec<u8>>) -> String {
+        let patch = String::from_utf8(patch.expect("a patch")).unwrap();
+        let header = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n";
+        patch.strip_prefix(header).unwrap_or_else(|| panic!("unexpected header: {patch}")).to_string()
+    }
+
+    #[test]
+    fn discarding_an_added_line_takes_it_out_and_keeps_the_rest() {
+        // "+B" is taken out; "B2" stays (context), and the removal of "b" stays removed.
+        let patch = diff(TWO_HUNKS).discard_patch(only(&[(0, 2)])).unwrap();
+        assert_eq!(discard_hunks(patch), "@@ -1,5 +1,4 @@\n a\n-B\n B2\n c\n d\n");
+    }
+
+    #[test]
+    fn discarding_a_removed_line_puts_it_back() {
+        let patch = diff(TWO_HUNKS).discard_patch(only(&[(0, 1)])).unwrap();
+        assert_eq!(discard_hunks(patch), "@@ -1,5 +1,6 @@\n a\n+b\n B\n B2\n c\n d\n");
+    }
+
+    #[test]
+    fn discarding_a_later_hunk_uses_working_file_line_numbers() {
+        // The second hunk starts at line 11 of the working file (the first hunk added a line).
+        let patch = diff(TWO_HUNKS).discard_patch(|at| at.hunk == 1).unwrap();
+        assert_eq!(discard_hunks(patch), "@@ -11,3 +11,3 @@\n x\n+y\n-Y\n z\n");
+        // Discarding both hunks: the second moves up by what the first took out.
+        let both = diff(TWO_HUNKS).discard_patch(|_| true).unwrap();
+        assert_eq!(discard_hunks(both), "@@ -1,5 +1,4 @@\n a\n+b\n-B\n-B2\n c\n d\n@@ -11,3 +10,3 @@\n x\n+y\n-Y\n z\n");
+        assert_eq!(diff(TWO_HUNKS).discard_patch(|_| false).unwrap(), None);
+    }
+
+    #[test]
+    fn discarding_lines_of_a_new_file_edits_it() {
+        let patch = "diff --git a/n b/n\nnew file mode 100644\n--- /dev/null\n+++ b/n\n@@ -0,0 +1,3 @@\n+one\n+two\n+three\n";
+        let out = String::from_utf8(parse_patch(patch.as_bytes(), 100).discard_patch(|at| at.line == 1).unwrap().unwrap()).unwrap();
+        assert_eq!(out, "diff --git a/n b/n\n--- a/n\n+++ b/n\n@@ -1,3 +1,2 @@\n one\n-two\n three\n");
+    }
+
+    #[test]
+    fn a_deleted_file_has_no_lines_to_discard() {
+        let patch = "diff --git a/d b/d\ndeleted file mode 100644\n--- a/d\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-gone\n";
+        let err = parse_patch(patch.as_bytes(), 100).discard_patch(|_| true).unwrap_err();
+        assert!(err.to_string().contains("deleted"), "{err}");
+    }
+
+    #[test]
+    fn discarding_keeps_crlf_and_handles_no_newline_markers() {
+        let body = b"@@ -1,2 +1,2 @@\r\n a\r\n-old\r\n+new\r\n";
+        let crlf = parse_patch(&[HEADER.as_bytes(), body].concat(), 100);
+        let out = crlf.discard_patch(|at| at.line == 2).unwrap().unwrap();
+        assert!(out.ends_with(b"@@ -1,2 +1,1 @@\n a\r\n-new\r\n"), "{:?}", String::from_utf8_lossy(&out));
+
+        let body = "@@ -1,1 +1,2 @@\n-last\n\\ No newline at end of file\n+last\n+more\n";
+        let marked = diff(body);
+        assert_eq!(discard_hunks(marked.discard_patch(only(&[(0, 3)])).unwrap()), "@@ -1,2 +1,1 @@\n last\n-more\n");
+        let err = marked.discard_patch(only(&[(0, 0)])).unwrap_err();
+        assert!(err.to_string().contains("discarded together"), "{err}");
     }
 
     #[test]

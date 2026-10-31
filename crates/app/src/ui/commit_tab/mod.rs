@@ -18,7 +18,8 @@ use craft_ui::layout::SplitAxis;
 use gitcraft_git::{AmendInfo, CommitRequest, FileDiff, LineRef, MAX_STATUS_ENTRIES, Status, StatusEntry, WorkingChange};
 
 use crate::prestage::{Prestage, Saved};
-use crate::ui::diff_view::{self, DiffState, DiffView, TickClick, TickTarget, Ticks};
+use crate::ui::confirm::Confirm;
+use crate::ui::diff_view::{self, DiffAction, DiffState, DiffView, TickClick, TickTarget, Ticks};
 use crate::ui::file_row;
 use crate::ui::split::{self, Split};
 pub use ticks::Partial;
@@ -103,6 +104,15 @@ pub enum Action {
         path: String,
         command: FileCommand,
     },
+    /// "Discard …" from a checkbox's right-click menu: ask `question`, then apply `patch` (from
+    /// `FileDiff::discard_patch`) to the file.
+    DiscardLines {
+        path: String,
+        patch: Vec<u8>,
+        question: Confirm,
+    },
+    /// Something couldn't be done; the message says why (for the status bar).
+    Problem(String),
 }
 
 /// The right-click menu of a changed file.
@@ -329,6 +339,29 @@ impl Changes {
         self.normalize(&path);
     }
 
+    /// "Discard …" was chosen from a checkbox's right-click menu in the selected file's diff:
+    /// the patch that throws those lines' changes away, and the question to ask first.
+    pub fn discard_action(&self, target: TickTarget) -> Option<Action> {
+        let path = self.selected.clone()?;
+        let DiffState::Loaded(view) = &self.diff else {
+            return None;
+        };
+        let lines = match target {
+            TickTarget::Line(at) => vec![at],
+            TickTarget::Hunk(hunk) => ticks::hunk_lines(&view.diff, hunk),
+            TickTarget::Block(block) => view.blocks.get(block)?.lines.clone(),
+        };
+        let chosen: BTreeSet<LineRef> = lines.iter().copied().collect();
+        let kind_of = |at: &LineRef| view.diff.hunks.get(at.hunk).and_then(|hunk| hunk.lines.get(at.line)).map(|line| line.kind);
+        let added = lines.iter().filter(|at| kind_of(at) == Some(gitcraft_git::LineKind::Added)).count();
+        let removed = lines.iter().filter(|at| kind_of(at) == Some(gitcraft_git::LineKind::Removed)).count();
+        match view.diff.discard_patch(|at| chosen.contains(&at)) {
+            Ok(Some(patch)) => Some(Action::DiscardLines { question: menu::discard_lines_question(&path, added, removed), path, patch }),
+            Ok(None) => None,
+            Err(error) => Some(Action::Problem(format!("Could not discard those lines: {error}"))),
+        }
+    }
+
     /// A file with every line ticked (or none) is simply ticked (or not).
     fn normalize(&mut self, path: &str) {
         let Some(partial) = self.partial.get(path) else {
@@ -480,6 +513,8 @@ pub fn show(ui: &mut egui::Ui, changes: &mut Changes, ratio: &mut f32, programs:
         DiffState::Loaded(view) => changes.line_ticks_blocker(&view.diff),
         _ => None,
     };
+    // A deleted file has no lines on disk to discard (the whole-file discard covers it).
+    let can_discard = changes.entry(&path).is_some_and(|entry| entry.change() != WorkingChange::Deleted);
     let mut action = None;
     let mut clicked = None;
     split::two_panes(
@@ -500,14 +535,16 @@ pub fn show(ui: &mut egui::Ui, changes: &mut Changes, ratio: &mut f32, programs:
                     Tick::Nothing => false,
                     Tick::Lines => !unticked.contains(&at),
                 };
-                let ticks = Ticks { enabled: blocker.is_none(), disabled_reason: blocker.unwrap_or_default(), is_ticked: &is_ticked };
+                let ticks = Ticks { enabled: blocker.is_none(), disabled_reason: blocker.unwrap_or_default(), is_ticked: &is_ticked, can_discard };
                 clicked = diff_view::show(ui, &diff, ("working", shown.as_deref()), Some(&ticks));
             }
         },
     );
     changes.diff = diff;
-    if let Some(click) = clicked {
-        changes.click_tick(click);
+    match clicked {
+        Some(DiffAction::Tick(click)) => changes.click_tick(click),
+        Some(DiffAction::Discard(target)) => action = action.or(changes.discard_action(target)),
+        None => {}
     }
     action
 }
