@@ -5,12 +5,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use craft_dialogs::{Answer, Dialogs, FileDialog};
+use craft_menu::MenuBar;
 use craft_settings::{SaveStatus, SettingsStore};
 use gitcraft_git::{DEFAULT_LOG_LIMIT, Log, Repo};
 
+use crate::commands::Command;
 use crate::settings::Prefs;
 use crate::ui::status_bar::StatusLine;
-use crate::ui::{commit_list, status_bar};
+use crate::ui::tabs::MainTab;
+use crate::ui::{about, menu, placeholder, repository, status_bar, tabs};
 use crate::worker::{Event, Job, Worker};
 
 /// The product name, used for the window title and messages.
@@ -39,6 +42,12 @@ pub struct GitCraftApp {
     open: Option<OpenRepo>,
     /// The latest problem to show in the status bar. Cleared when a repository opens.
     error: Option<String>,
+    /// The menus, laid out for this platform once at startup.
+    menu_bar: MenuBar,
+    /// The window title last sent to the OS, so it is only sent again when it changes.
+    window_title: String,
+    tab: MainTab,
+    about_open: bool,
 }
 
 impl GitCraftApp {
@@ -59,6 +68,42 @@ impl GitCraftApp {
             dialogs: Dialogs::new(Arc::new(move || dialog_ctx.request_repaint())),
             open: None,
             error: worker_error.or(startup_problem),
+            menu_bar: menu::laid_out(),
+            window_title: APP_NAME.to_string(),
+            tab: MainTab::Repository,
+            about_open: false,
+        }
+    }
+
+    /// Runs a command chosen from the menu or by its shortcut.
+    fn run(&mut self, command: Command) {
+        match command {
+            Command::OpenRepository => {
+                // Opening a repository is about the Repository tab, so show it.
+                self.tab = MainTab::Repository;
+                self.ask_for_repository();
+            }
+            Command::About => self.about_open = true,
+        }
+    }
+
+    /// Runs commands whose keyboard shortcut was pressed this frame. Skipped while a menu or a
+    /// dialog has the keyboard, so the keys go to them instead.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if craft_menu::bar::is_open(ctx) || self.dialogs.is_open() || self.about_open {
+            return;
+        }
+        // If the keyboard is on the menu bar (after a tap on Alt), a shortcut leaves it and runs.
+        craft_menu::bar::leave_for_shortcut(ctx);
+        for command in Command::ALL {
+            let Some(chord) = command.shortcut() else {
+                continue;
+            };
+            // `consume_shortcut` returns true (once) if the keys were pressed, and removes the
+            // key press so no widget also reacts to it.
+            if ctx.input_mut(|input| input.consume_shortcut(&chord.to_egui_shortcut())) {
+                self.run(command);
+            }
         }
     }
 
@@ -168,9 +213,28 @@ impl GitCraftApp {
     /// (which needs an `eframe::Frame`) so tests can run it without a window.
     fn update(&mut self, ctx: &egui::Context) {
         self.remember_window(ctx);
+        self.handle_shortcuts(ctx);
         self.handle_dialog_answers();
         self.handle_worker_events();
+        self.sync_window_title(ctx);
         self.save_settings_when_due(ctx);
+    }
+
+    /// The title the window should have: "GitCraft — <full path>" while a repository is open.
+    fn wanted_window_title(&self) -> String {
+        match &self.open {
+            Some(open) => format!("{APP_NAME} — {}", open.repo.root().display()),
+            None => APP_NAME.to_string(),
+        }
+    }
+
+    /// Tells the OS the new title when it changes (not every frame).
+    fn sync_window_title(&mut self, ctx: &egui::Context) {
+        let wanted = self.wanted_window_title();
+        if wanted != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(wanted.clone()));
+            self.window_title = wanted;
+        }
     }
 
     fn is_busy(&self) -> bool {
@@ -200,41 +264,25 @@ impl GitCraftApp {
     /// Draws the whole window. Kept separate from `eframe::App::ui` (which also needs an
     /// `eframe::Frame`) so tests can run it on a bare `egui::Context` without opening a window.
     pub fn draw(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Open repository…").clicked() {
-                    self.ask_for_repository();
-                }
-                if let Some(open) = &self.open {
-                    ui.separator();
-                    ui.label(open.repo.root().display().to_string());
-                }
-            });
-        });
+        // Panels are added outside-in: menu bar, tab strip and (in the Repository tab) its
+        // toolbar along the top, the status bar along the bottom, then the content fills the rest.
+        let chosen = egui::Panel::top("menu_bar").show(ui, |ui| menu::show(ui, &self.menu_bar)).inner;
+        for command in chosen {
+            self.run(command);
+        }
+        egui::Panel::top("tabs").show(ui, |ui| tabs::show(ui, &mut self.tab));
+        if let (MainTab::Repository, Some(open)) = (self.tab, &self.open) {
+            egui::Panel::top("repository_toolbar").show(ui, |ui| repository::toolbar(ui, open.repo.root()));
+        }
         let status = self.status_line();
         egui::Panel::bottom("status_bar").show(ui, |ui| status_bar::show(ui, &status));
-        egui::CentralPanel::default().show(ui, |ui| match &self.open {
-            Some(open) if open.log.commits.is_empty() => {
-                ui.centered_and_justified(|ui| {
-                    ui.label("This repository has no commits yet.");
-                });
-            }
-            Some(open) => commit_list::show(ui, &open.log.commits),
-            None => self.draw_welcome(ui),
+        egui::CentralPanel::default().show(ui, |ui| match (self.tab, &self.open) {
+            (MainTab::Repository, Some(open)) => repository::body(ui, &open.log.commits),
+            (MainTab::Repository, None) => repository::welcome(ui),
+            (MainTab::Issues, _) => placeholder::coming_later(ui, "Issues", 5),
+            (MainTab::Projects, _) => placeholder::coming_later(ui, "Projects", 6),
         });
-    }
-
-    /// Shown while no repository is open.
-    fn draw_welcome(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() / 3.0);
-            ui.heading(APP_NAME);
-            ui.label("Open a repository to see its history.");
-            ui.add_space(8.0);
-            if ui.button("Open repository…").clicked() {
-                self.ask_for_repository();
-            }
-        });
+        about::show(ui.ctx(), &mut self.about_open);
     }
 
     /// Shows any queued file dialog. Must run at the end of the frame (craft-dialogs' rule);
@@ -332,6 +380,91 @@ mod tests {
             run_frame(app, ctx, egui::RawInput::default());
             !app.is_busy()
         });
+    }
+
+    /// Input for one frame in which Ctrl+O (⌘O on macOS) is pressed.
+    fn ctrl_o() -> egui::RawInput {
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::O,
+                physical_key: Some(egui::Key::O),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Makes the folder picker count how often it is asked, and answer Cancel.
+    fn count_dialogs(app: &mut GitCraftApp) -> std::rc::Rc<std::cell::Cell<usize>> {
+        // `Rc<Cell<..>>`: a shared counter the dialog override (a closure kept by `Dialogs`) and
+        // the test can both reach. Single-threaded, so no Arc or atomics needed.
+        let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = std::rc::Rc::clone(&asked);
+        app.dialogs.set_override(Some(Box::new(move |_request| {
+            counter.set(counter.get() + 1);
+            Answer::Cancelled
+        })));
+        asked
+    }
+
+    #[test]
+    fn ctrl_o_asks_for_a_repository() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        let asked = count_dialogs(&mut app);
+        run_frame(&mut app, &ctx, ctrl_o());
+        run_frame(&mut app, &ctx, egui::RawInput::default());
+        assert_eq!(asked.get(), 1);
+    }
+
+    #[test]
+    fn open_repository_switches_to_the_repository_tab() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        let asked = count_dialogs(&mut app);
+        app.tab = MainTab::Issues;
+        app.run(Command::OpenRepository);
+        run_frame(&mut app, &ctx, egui::RawInput::default());
+        assert_eq!(app.tab, MainTab::Repository);
+        assert_eq!(asked.get(), 1);
+    }
+
+    #[test]
+    fn about_opens_and_shortcuts_wait_while_it_is_up() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        let asked = count_dialogs(&mut app);
+        app.run(Command::About);
+        run_frame(&mut app, &ctx, egui::RawInput::default());
+        assert!(app.about_open);
+        run_frame(&mut app, &ctx, ctrl_o());
+        assert_eq!(asked.get(), 0, "Ctrl+O must not open a picker over the About window");
+    }
+
+    #[test]
+    fn every_tab_draws() {
+        let repo = TestRepo::with_commits(&["One"]);
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        for tab in MainTab::ALL {
+            app.tab = tab;
+            run_frame(&mut app, &ctx, egui::RawInput::default());
+            run_frame(&mut app, &ctx, egui::RawInput::default());
+        }
+    }
+
+    #[test]
+    fn window_title_shows_the_open_repository() {
+        let repo = TestRepo::with_commits(&["One"]);
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        assert_eq!(app.window_title, "GitCraft");
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        let root = app.open.as_ref().map(|open| open.repo.root().display().to_string()).unwrap();
+        assert_eq!(app.window_title, format!("GitCraft — {root}"));
     }
 
     #[test]

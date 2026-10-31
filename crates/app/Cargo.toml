@@ -13,8 +13,10 @@ workspace = true
 [dependencies]
 chrono = { workspace = true }
 craft-dialogs = { workspace = true }
+craft-menu = { workspace = true }
 craft-quit = { workspace = true }
 craft-settings = { workspace = true }
+craft-ui = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 egui_extras = { workspace = true }

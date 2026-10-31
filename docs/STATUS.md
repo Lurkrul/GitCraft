@@ -13,7 +13,7 @@ Apache-2.0, matching craft-libs.
 | 4a | Settings: remember window size and maximized state (done early, on request) | done |
 | 2 | `gitcraft-git`: locate git, run commands, validate repo, parse log | done |
 | 3 | Worker thread, folder picker, commit list, status bar | done |
-| 4b | Settings: remember and reopen the last repository | next |
+| 4b | Settings: remember and reopen the last repository | moved to R7 below |
 
 ## Done
 
@@ -50,6 +50,31 @@ Apache-2.0, matching craft-libs.
   - Verified on Windows: opened this repo through the real folder picker; opening a non-repository
     showed the error and kept the history. A 12,000-commit repository loads 10,000 in about 0.3 s
     (debug build).
+
+## UI rework (approved 2026-10-31; brings Milestone 2 forward)
+
+Decisions: initials avatars for now (GitHub avatars opt-in after sign-in, Milestone 4); right pane
+shows commit info, then the changed files, then the selected file's diff; the branch dropdown only
+filters (no checkout until Milestone 3); toolbar has the branch dropdown at the far left, then the
+repository name (full path on hover and in the window title).
+
+| Step | What | State |
+|---|---|---|
+| R1 | Commit step 3 | done (`f22430c`) |
+| R2 | Window shell: menu bar (craft-menu), tabs (craft-ui), repository toolbar | done |
+| R3 | Refs + branch dropdown filtering the history | next |
+| R4 | Lane assignment (pure, tested), graph drawing, ref labels, initials avatars | |
+| R5 | Two panes (craft-ui split), commit selection, details panel | |
+| R6 | Diff parsing and diff view | |
+| R7 | Reopen last repository; remember divider and branch per repository | |
+
+R2 details:
+- File menu: Open Repository… (Ctrl+O), then Exit (added by craft-menu's layout). Help: About GitCraft.
+- Tabs: Repository, Issues and Projects (the last two are placeholders until Milestones 5 and 6).
+- Repository toolbar: branch dropdown ("All branches" only for now), then the repository name.
+- Window title: "GitCraft — <path>" while a repository is open.
+- Shortcuts wait while a menu, dialog or the About window is open.
+- Verified on Windows: Ctrl+O, the File and Help menus, About and Close, Exit, and tab switching.
 
 ## To verify on Fedora (deferred; batched for later)
 

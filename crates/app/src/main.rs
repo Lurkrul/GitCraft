@@ -4,6 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod commands;
 mod settings;
 #[cfg(test)]
 mod test_support;

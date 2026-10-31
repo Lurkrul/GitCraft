@@ -14,6 +14,7 @@ repository = "https://github.com/Lurkrul/GitCraft"
 # Shared Crafting App libraries, pinned to one immutable commit. When this rev changes, update
 # the [patch.crates-io] section below to match craft-libs' own Cargo.toml at the same rev.
 craft-dialogs = { git = "https://github.com/storytold/craft-libs", rev = "c39e435cc34417843793df240a0b38bac970179b" }
+craft-menu = { git = "https://github.com/storytold/craft-libs", rev = "c39e435cc34417843793df240a0b38bac970179b" }
 craft-quit = { git = "https://github.com/storytold/craft-libs", rev = "c39e435cc34417843793df240a0b38bac970179b", features = ["egui"] }
 craft-settings = { git = "https://github.com/storytold/craft-libs", rev = "c39e435cc34417843793df240a0b38bac970179b" }
 craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "c39e435cc34417843793df240a0b38bac970179b" }
