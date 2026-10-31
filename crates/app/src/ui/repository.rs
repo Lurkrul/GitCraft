@@ -6,8 +6,9 @@ use gitcraft_git::{LogScope, Ref, Refs};
 
 use crate::commands::Command;
 use crate::graph::History;
-use crate::ui::commit_list;
+use crate::ui::details::{self, DetailsState};
 use crate::ui::ref_labels::LabelMap;
+use crate::ui::{commit_list, split};
 
 const ALL_BRANCHES: &str = "All branches";
 /// Most rows the open dropdown shows before it scrolls.
@@ -91,14 +92,46 @@ pub fn toolbar(ui: &mut egui::Ui, root: &Path, refs: &Refs, selected: &LogScope)
 }
 
 /// The history area, below the toolbar.
-pub fn body(ui: &mut egui::Ui, history: &History, labels: &LabelMap) {
-    if history.log.commits.is_empty() {
+/// What the history area needs to draw.
+pub struct BodyView<'a> {
+    pub history: &'a History,
+    pub labels: &'a LabelMap,
+    /// The selected commit's id.
+    pub selected: Option<&'a str>,
+    pub details: &'a DetailsState,
+    /// A row to scroll into view this frame (after keyboard navigation).
+    pub scroll_to: Option<usize>,
+}
+
+/// A commit the user picked in the history area this frame.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Pick {
+    /// A row of the history list.
+    Row(usize),
+    /// A commit by id (a parent link in the details panel).
+    Commit(String),
+}
+
+/// The history area, below the toolbar: the history on the left, the selected commit's details
+/// on the right, with a draggable divider. `split` is the history's share of the width.
+pub fn body(ui: &mut egui::Ui, view: &BodyView<'_>, split: &mut f32, details_expanded: &mut bool) -> Option<Pick> {
+    if view.history.log.commits.is_empty() {
         ui.centered_and_justified(|ui| {
             ui.label("This repository has no commits yet.");
         });
-    } else {
-        commit_list::show(ui, history, labels);
+        return None;
     }
+    // One variable per pane: both closures are alive at once, and Rust allows only one of them
+    // to borrow a given variable mutably.
+    let (mut row, mut parent) = (None, None);
+    split::two_panes(
+        ui,
+        egui::Id::unique("history-details-split"),
+        split,
+        |ui| row = commit_list::show(ui, view.history, view.labels, view.selected, view.scroll_to),
+        |ui| parent = details::show(ui, view.details, details_expanded),
+    );
+    row.map(Pick::Row).or(parent.map(Pick::Commit))
 }
 
 /// Shown in the Repository tab while no repository is open.

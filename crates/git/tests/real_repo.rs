@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use gitcraft_git::{Git, GitError, Head, LogScope, RefKind};
+use gitcraft_git::{FileStatus, Git, GitError, Head, LogScope, RefKind};
 
 /// A throwaway repository. Both folders are deleted when this is dropped.
 struct TestRepo {
@@ -296,4 +296,76 @@ fn a_scope_must_be_a_full_ref_name() {
     // A branch that doesn't exist is git's error, reported as such.
     let err = git.log(&opened, &LogScope::Ref("refs/heads/missing".into()), 10).unwrap_err();
     assert!(matches!(err, GitError::CommandFailed { .. }), "{err:?}");
+}
+
+#[test]
+fn commit_details_show_message_people_and_files() {
+    let repo = TestRepo::new();
+    std::fs::write(repo.path().join("readme.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(repo.path().join("logo.bin"), [0u8, 1, 2, 3, 0]).unwrap();
+    repo.git(&["add", "."]);
+    let root = repo.commit("Initial import");
+
+    std::fs::write(repo.path().join("readme.txt"), "one\n2\nthree\n").unwrap();
+    repo.git(&["mv", "logo.bin", "icon.bin"]);
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-q", "-m", "Edit readme\n\nAnd rename the logo."]);
+    let second = repo.git(&["rev-parse", "HEAD"]);
+
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+
+    let details = git.commit_details(&opened, &second).unwrap();
+    assert_eq!(details.id, second);
+    assert_eq!(details.parents, std::slice::from_ref(&root));
+    assert_eq!(details.message, "Edit readme\n\nAnd rename the logo.");
+    assert_eq!((details.author_name.as_str(), details.author_email.as_str()), ("Test Author", "test@example.com"));
+    assert_eq!(details.author_time, 1_700_000_000);
+    assert_eq!(details.committer_name, "Test Author");
+
+    let files: Vec<_> = details.files.iter().map(|f| (f.status, f.path.as_str(), f.old_path.as_deref(), f.lines)).collect();
+    assert_eq!(files, [(FileStatus::Renamed, "icon.bin", Some("logo.bin"), None), (FileStatus::Modified, "readme.txt", None, Some((2, 1)))]);
+
+    // A root commit: every file is added.
+    let details = git.commit_details(&opened, &root).unwrap();
+    assert!(details.parents.is_empty());
+    assert!(details.files.iter().all(|f| f.status == FileStatus::Added), "{:?}", details.files);
+    assert_eq!(details.files.len(), 2);
+}
+
+#[test]
+fn merge_details_compare_with_the_first_parent() {
+    let repo = TestRepo::new();
+    std::fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    repo.git(&["add", "."]);
+    repo.commit("Base");
+    repo.git(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
+    repo.git(&["add", "."]);
+    repo.commit("Feature");
+    repo.git(&["checkout", "-q", "main"]);
+    std::fs::write(repo.path().join("main.txt"), "main\n").unwrap();
+    repo.git(&["add", "."]);
+    repo.commit("Main");
+    repo.git(&["merge", "-q", "--no-ff", "feature", "-m", "Merge feature"]);
+    let merge = repo.git(&["rev-parse", "HEAD"]);
+
+    let git = git();
+    let details = git.commit_details(&git.open_repo(repo.path()).unwrap(), &merge).unwrap();
+    assert_eq!(details.parents.len(), 2);
+    // Against the first parent (main), the merge brought in the feature's file.
+    let paths: Vec<_> = details.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["feature.txt"]);
+}
+
+#[test]
+fn commit_details_need_a_full_hash() {
+    let repo = TestRepo::new();
+    repo.commit("One");
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    assert!(matches!(git.commit_details(&opened, "HEAD"), Err(GitError::Malformed { .. })));
+    assert!(matches!(git.commit_details(&opened, "--output=x"), Err(GitError::Malformed { .. })));
+    // Well-formed but not in this repository: git's own error.
+    assert!(matches!(git.commit_details(&opened, &"0".repeat(40)), Err(GitError::CommandFailed { .. })));
 }

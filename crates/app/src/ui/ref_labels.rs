@@ -72,7 +72,7 @@ pub fn show(ui: &mut egui::Ui, labels: &[RefLabel], lane_color: egui::Color32) {
             .corner_radius(3.0)
             .inner_margin(egui::Margin::symmetric(4, 0))
             .show(ui, |ui| {
-                ui.label(text);
+                ui.add(egui::Label::new(text).selectable(false));
             })
             .response
             .on_hover_text(tooltip);

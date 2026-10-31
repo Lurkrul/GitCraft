@@ -3,9 +3,12 @@
 
 pub mod about;
 pub mod commit_list;
+pub mod details;
 pub mod menu;
 pub mod placeholder;
 pub mod ref_labels;
 pub mod repository;
+pub mod split;
 pub mod status_bar;
 pub mod tabs;
+pub mod time;

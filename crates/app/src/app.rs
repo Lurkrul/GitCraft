@@ -12,10 +12,11 @@ use gitcraft_git::{DEFAULT_LOG_LIMIT, LogScope, Refs, Repo};
 use crate::commands::Command;
 use crate::graph::History;
 use crate::settings::Prefs;
+use crate::ui::details::DetailsState;
 use crate::ui::ref_labels::{self, LabelMap};
 use crate::ui::status_bar::StatusLine;
 use crate::ui::tabs::MainTab;
-use crate::ui::{about, menu, placeholder, repository, status_bar, tabs};
+use crate::ui::{about, menu, placeholder, repository, split, status_bar, tabs};
 use crate::worker::{Event, Job, Worker};
 
 /// The product name, used for the window title and messages.
@@ -40,6 +41,24 @@ struct OpenRepo {
     selected_scope: LogScope,
     /// The scope `log` was read with.
     log_scope: LogScope,
+    /// The selected commit's id.
+    selected: Option<String>,
+    /// The selected commit's details, for the right pane.
+    details: DetailsState,
+}
+
+impl OpenRepo {
+    fn new(repo: Repo, refs: Refs, history: History) -> OpenRepo {
+        let labels = ref_labels::label_map(&refs);
+        let scope = LogScope::AllBranches;
+        OpenRepo { repo, refs, labels, history, selected_scope: scope.clone(), log_scope: scope, selected: None, details: DetailsState::Empty }
+    }
+
+    /// The row of the selected commit in the current history, if it is in it.
+    fn selected_row(&self) -> Option<usize> {
+        let selected = self.selected.as_deref()?;
+        self.history.log.commits.iter().position(|commit| commit.id == selected)
+    }
 }
 
 /// All of the app's state. eframe owns it and calls `logic` and `ui` on it every frame.
@@ -57,6 +76,12 @@ pub struct GitCraftApp {
     window_title: String,
     tab: MainTab,
     about_open: bool,
+    /// The history pane's share of the width in the Repository tab.
+    split: f32,
+    /// A history row to bring into view on the next frame.
+    scroll_to: Option<usize>,
+    /// Whether the details panel's "More info" is open. Kept as the user moves between commits.
+    details_expanded: bool,
 }
 
 impl GitCraftApp {
@@ -82,6 +107,9 @@ impl GitCraftApp {
             // The Commit tab comes first but has nothing to show until Milestone 3.
             tab: MainTab::Repository,
             about_open: false,
+            split: split::DEFAULT_RATIO,
+            scroll_to: None,
+            details_expanded: false,
         }
     }
 
@@ -191,9 +219,7 @@ impl GitCraftApp {
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::Opened { repo, refs, history } => {
-                let scope = LogScope::AllBranches;
-                let labels = ref_labels::label_map(&refs);
-                self.open = Some(OpenRepo { repo, refs, labels, history, selected_scope: scope.clone(), log_scope: scope });
+                self.open = Some(OpenRepo::new(repo, refs, history));
                 self.error = None;
             }
             // The repository already on screen (if any) stays; the error explains what happened.
@@ -204,7 +230,21 @@ impl GitCraftApp {
                 if let Some(open) = self.open.as_mut().filter(|open| open.repo == repo && open.selected_scope == scope) {
                     open.history = history;
                     open.log_scope = scope;
+                    // The selection stays if the commit is in this history too; otherwise it goes.
+                    if open.selected_row().is_none() {
+                        open.selected = None;
+                        open.details = DetailsState::Empty;
+                    }
                     self.error = None;
+                }
+            }
+            Event::DetailsLoaded { repo, id, result } => {
+                // Only for the commit still selected: the user may have clicked on since.
+                if let Some(open) = self.open.as_mut().filter(|open| open.repo == repo && open.selected.as_deref() == Some(id.as_str())) {
+                    open.details = match result {
+                        Ok(details) => DetailsState::Loaded(Box::new(details)),
+                        Err(error) => DetailsState::Failed(format!("Could not read this commit: {error}")),
+                    };
                 }
             }
             Event::LogFailed { repo, scope, error } => {
@@ -265,6 +305,7 @@ impl GitCraftApp {
     fn update(&mut self, ctx: &egui::Context) {
         self.remember_window(ctx);
         self.handle_shortcuts(ctx);
+        self.handle_arrow_keys(ctx);
         self.handle_dialog_answers();
         self.handle_worker_events();
         self.sync_window_title(ctx);
@@ -334,14 +375,98 @@ impl GitCraftApp {
         }
         let status = self.status_line();
         egui::Panel::bottom("status_bar").show(ui, |ui| status_bar::show(ui, &status));
-        egui::CentralPanel::default().show(ui, |ui| match (self.tab, &self.open) {
-            (MainTab::Repository, Some(open)) => repository::body(ui, &open.history, &open.labels),
-            (MainTab::Repository, None) => repository::welcome(ui),
-            (MainTab::Commit, _) => placeholder::coming_later(ui, "Committing", 3),
-            (MainTab::Issues, _) => placeholder::coming_later(ui, "Issues", 5),
-            (MainTab::Projects, _) => placeholder::coming_later(ui, "Projects", 6),
-        });
+        // `take` uses the scroll request once: it is only for the frame after a keyboard move.
+        let scroll_to = self.scroll_to.take();
+        let pick = egui::CentralPanel::default()
+            .show(ui, |ui| match (self.tab, &self.open) {
+                (MainTab::Repository, Some(open)) => {
+                    let view = repository::BodyView {
+                        history: &open.history,
+                        labels: &open.labels,
+                        selected: open.selected.as_deref(),
+                        details: &open.details,
+                        scroll_to,
+                    };
+                    repository::body(ui, &view, &mut self.split, &mut self.details_expanded)
+                }
+                (MainTab::Repository, None) => {
+                    repository::welcome(ui);
+                    None
+                }
+                (MainTab::Commit, _) => {
+                    placeholder::coming_later(ui, "Committing", 3);
+                    None
+                }
+                (MainTab::Issues, _) => {
+                    placeholder::coming_later(ui, "Issues", 5);
+                    None
+                }
+                (MainTab::Projects, _) => {
+                    placeholder::coming_later(ui, "Projects", 6);
+                    None
+                }
+            })
+            .inner;
+        match pick {
+            Some(repository::Pick::Row(row)) => self.select_row(row),
+            Some(repository::Pick::Commit(id)) => {
+                // A parent link: select it, and bring it into view if it is in the list.
+                self.select_commit(id);
+                self.scroll_to = self.open.as_ref().and_then(OpenRepo::selected_row);
+            }
+            None => {}
+        }
         about::show(ui.ctx(), &mut self.about_open);
+    }
+
+    /// Selects the commit in row `row` of the history.
+    fn select_row(&mut self, row: usize) {
+        let id = self.open.as_ref().and_then(|open| open.history.log.commits.get(row)).map(|commit| commit.id.clone());
+        if let Some(id) = id {
+            self.select_commit(id);
+        }
+    }
+
+    /// Selects a commit and starts reading its details in the background.
+    fn select_commit(&mut self, id: String) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        if open.selected.as_deref() == Some(id.as_str()) {
+            return; // Already selected (and loaded or loading).
+        }
+        open.selected = Some(id.clone());
+        open.details = DetailsState::Loading;
+        let job = Job::LoadDetails { repo: open.repo.clone(), id };
+        self.send(job);
+    }
+
+    /// ↑ and ↓ move the selection through the history while nothing else wants the keys.
+    fn handle_arrow_keys(&mut self, ctx: &egui::Context) {
+        let busy_elsewhere = self.tab != MainTab::Repository
+            || craft_menu::bar::is_open(ctx)
+            || self.dialogs.is_open()
+            || self.about_open
+            || ctx.memory(|memory| memory.focused().is_some())
+            || egui::Popup::is_any_open(ctx);
+        let Some(open) = self.open.as_ref().filter(|_| !busy_elsewhere) else {
+            return;
+        };
+        let count = open.history.log.commits.len();
+        let current = open.selected_row();
+        let next = ctx.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                Some(current.map_or(0, |row| (row + 1).min(count.saturating_sub(1))))
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                Some(current.map_or(0, |row| row.saturating_sub(1)))
+            } else {
+                None
+            }
+        });
+        if let Some(row) = next.filter(|_| count > 0) {
+            self.select_row(row);
+            self.scroll_to = Some(row);
+        }
     }
 
     /// Shows any queued file dialog. Must run at the end of the frame (craft-dialogs' rule);
@@ -611,6 +736,140 @@ mod tests {
         let names: Vec<_> = open.refs.branches().map(|r| r.short_name().to_string()).collect();
         assert_eq!(names, ["feature", "main"]);
         assert_eq!(open.refs.head_branch(), Some("refs/heads/main"));
+    }
+
+    /// Input for one frame in which `key` is pressed.
+    fn press(key: egui::Key) -> egui::RawInput {
+        egui::RawInput {
+            events: vec![egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }],
+            ..Default::default()
+        }
+    }
+
+    fn selected_summary(app: &GitCraftApp) -> Option<String> {
+        let open = app.open.as_ref()?;
+        open.history.log.commits.get(open.selected_row()?).map(|c| c.summary.clone())
+    }
+
+    fn loaded_message(app: &GitCraftApp) -> Option<String> {
+        match &app.open.as_ref()?.details {
+            DetailsState::Loaded(details) => Some(details.message.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn selecting_a_commit_loads_its_details() {
+        let repo = TestRepo::with_commits(&["First", "Second"]);
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        assert!(matches!(app.open.as_ref().unwrap().details, DetailsState::Empty));
+
+        app.select_row(1);
+        assert!(matches!(app.open.as_ref().unwrap().details, DetailsState::Loading));
+        settle(&mut app, &ctx);
+        assert_eq!(loaded_message(&app).as_deref(), Some("First"));
+    }
+
+    #[test]
+    fn the_last_selection_wins() {
+        let repo = TestRepo::with_commits(&["First", "Second", "Third"]);
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+
+        // Click three rows before any details arrive; only the last one's details may show.
+        app.select_row(0);
+        app.select_row(1);
+        app.select_row(2);
+        settle(&mut app, &ctx);
+        assert_eq!(selected_summary(&app).as_deref(), Some("First"));
+        assert_eq!(loaded_message(&app).as_deref(), Some("First"));
+    }
+
+    #[test]
+    fn arrow_keys_move_the_selection() {
+        let repo = TestRepo::with_commits(&["First", "Second", "Third"]);
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+
+        run_frame(&mut app, &ctx, press(egui::Key::ArrowDown));
+        assert_eq!(selected_summary(&app).as_deref(), Some("Third"), "↓ with nothing selected picks the newest");
+        run_frame(&mut app, &ctx, press(egui::Key::ArrowDown));
+        run_frame(&mut app, &ctx, press(egui::Key::ArrowDown));
+        run_frame(&mut app, &ctx, press(egui::Key::ArrowDown));
+        assert_eq!(selected_summary(&app).as_deref(), Some("First"), "stops at the oldest");
+        run_frame(&mut app, &ctx, press(egui::Key::ArrowUp));
+        assert_eq!(selected_summary(&app).as_deref(), Some("Second"));
+        settle(&mut app, &ctx);
+        assert_eq!(loaded_message(&app).as_deref(), Some("Second"));
+    }
+
+    #[test]
+    fn arrow_keys_wait_while_about_is_open() {
+        let repo = TestRepo::with_commits(&["First"]);
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.run(Command::About);
+        run_frame(&mut app, &ctx, press(egui::Key::ArrowDown));
+        assert_eq!(selected_summary(&app), None);
+    }
+
+    #[test]
+    fn a_parent_link_selects_the_parent() {
+        let repo = TestRepo::with_commits(&["First", "Second"]);
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.select_row(0);
+        settle(&mut app, &ctx);
+        let parent = match &app.open.as_ref().unwrap().details {
+            DetailsState::Loaded(details) => details.parents[0].clone(),
+            other => panic!("expected details, got {other:?}"),
+        };
+        app.select_commit(parent);
+        settle(&mut app, &ctx);
+        assert_eq!(selected_summary(&app).as_deref(), Some("First"));
+        assert_eq!(loaded_message(&app).as_deref(), Some("First"));
+    }
+
+    #[test]
+    fn switching_branch_keeps_a_selection_that_is_still_shown() {
+        let repo = repo_with_feature_branch();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+
+        let row =
+            |app: &GitCraftApp, summary: &str| app.open.as_ref().unwrap().history.log.commits.iter().position(|c| c.summary == summary).unwrap();
+        app.select_row(row(&app, "Base"));
+        app.select_scope(LogScope::Ref("refs/heads/main".into()));
+        settle(&mut app, &ctx);
+        assert_eq!(selected_summary(&app).as_deref(), Some("Base"), "Base is on main too");
+
+        app.select_scope(LogScope::AllBranches);
+        settle(&mut app, &ctx);
+        app.select_row(row(&app, "Feature work"));
+        app.select_scope(LogScope::Ref("refs/heads/main".into()));
+        settle(&mut app, &ctx);
+        assert_eq!(selected_summary(&app), None, "Feature work is not on main");
+        assert!(matches!(app.open.as_ref().unwrap().details, DetailsState::Empty));
+    }
+
+    #[test]
+    fn the_two_panes_draw_with_details_loaded() {
+        let repo = TestRepo::with_commits(&["First", "Second"]);
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.select_row(0);
+        settle(&mut app, &ctx);
+        run_frame(&mut app, &ctx, egui::RawInput::default());
+        run_frame(&mut app, &ctx, egui::RawInput::default());
+        assert!(loaded_message(&app).is_some());
     }
 
     #[test]

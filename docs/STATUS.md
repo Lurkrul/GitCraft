@@ -64,8 +64,8 @@ repository name (full path on hover and in the window title).
 | R2 | Window shell: menu bar (craft-menu), tabs (craft-ui), repository toolbar | done |
 | R3 | Refs + branch dropdown filtering the history | done |
 | R4 | Lane assignment (pure, tested), graph drawing, ref labels, initials avatars | done |
-| R5 | Two panes (craft-ui split), commit selection, details panel | next |
-| R6 | Diff parsing and diff view | |
+| R5 | Two panes (craft-ui split), commit selection, details panel | done |
+| R6 | Diff parsing and diff view | next |
 | R7 | Reopen last repository; remember divider and branch per repository | |
 
 R2 details:
@@ -104,6 +104,24 @@ R4 details:
 - The list shows only the graph and summaries (with labels). Author, date and hash move to the
   details panel (R5); until then, hovering a summary shows them.
 - Verified on Windows with a demo repository (two feature branches, a merge, a tag, a remote).
+
+R5 details:
+- Git layer: `commit_details(repo, id)` reads the full message, author and committer (with times),
+  parents, and changed files with status and +/- line counts (`None` for binary files), from
+  `git show` and `git diff-tree -z` (`--name-status` and `--numstat`, joined by path). A merge is
+  compared with its first parent; a root commit shows every file as added. The id must be a full hash.
+- Two panes via craft-ui `split_rect` and `ResizeHandle` (drag, or focus and press the arrow keys).
+  The ratio lives in memory for now; R7 saves it.
+- Clicking a row selects it; Up/Down move the selection when nothing else has focus and keep it in
+  view. Details load in the background; a result for a commit no longer selected is ignored.
+  Switching branch keeps the selection if the commit is still shown.
+- Details panel, collapsed: summary, author (avatar) and short hash, and the description cut to
+  3 lines with "…" (blank lines skipped in this preview), then a "More info" link. Expanded: the full
+  description, date, committer (only if different), full hash (selectable) and parent links
+  (click to select). The choice is sticky across commits (in memory; R7 could save it). The changed
+  files with coloured status letters and +/- counts always follow.
+- The summary tooltip in the list is gone (the panel shows it all).
+- Verified on Windows: merge and ordinary commits, divider drag, parent link, Down arrow.
 
 ## Open questions
 

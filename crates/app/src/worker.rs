@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
-use gitcraft_git::{DEFAULT_LOG_LIMIT, Git, GitError, LogScope, Refs, Repo};
+use gitcraft_git::{CommitDetails, DEFAULT_LOG_LIMIT, Git, GitError, LogScope, Refs, Repo};
 
 use crate::graph::History;
 
@@ -26,6 +26,8 @@ pub enum Job {
     Open(PathBuf),
     /// Read the history of an open repository again, in another scope (such as one branch).
     LoadLog { repo: Repo, scope: LogScope },
+    /// Read one commit in full (message, people, changed files) for the details panel.
+    LoadDetails { repo: Repo, id: String },
 }
 
 /// What the background thread reports back. Each [`Job`] produces exactly one event. Events say
@@ -37,6 +39,7 @@ pub enum Event {
     OpenFailed { path: PathBuf, error: GitError },
     LogLoaded { repo: Repo, scope: LogScope, history: History },
     LogFailed { repo: Repo, scope: LogScope, error: GitError },
+    DetailsLoaded { repo: Repo, id: String, result: Result<CommitDetails, GitError> },
 }
 
 /// The UI's handle on the background thread. Dropping it closes the job channel, which ends the
@@ -120,6 +123,10 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, wake: Wake) {
                 Ok(log) => Event::LogLoaded { repo, scope, history: History::new(log) },
                 Err(error) => Event::LogFailed { repo, scope, error },
             },
+            Job::LoadDetails { repo, id } => {
+                let result = located(&mut git).and_then(|git| git.commit_details(&repo, &id));
+                Event::DetailsLoaded { repo, id, result }
+            }
         };
         if events.send(event).is_err() {
             break; // The UI has gone away.
