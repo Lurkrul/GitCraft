@@ -125,6 +125,20 @@ your own.
 - [ ] A file whose old last line had no newline: ticking only the new line after it gives a clear
       message under the Commit button, and nothing is committed.
 
+## Commit tab: pre-staging (ticks saved)
+
+- [ ] Untick a file, close GitCraft and open it again: the file is still unticked.
+- [ ] Untick some lines of a file, restart: the same lines are unticked (the file's box part-filled).
+- [ ] After a restart, commit straight away without opening a partly ticked file's diff: only its
+      ticked lines are committed.
+- [ ] A change made while GitCraft was closed (a new file, or a new edit) starts ticked.
+- [ ] After committing part of a file, what is left of it is unticked, and stays so after a restart.
+- [ ] `git status` / `git diff --cached` in a terminal show nothing staged by unticking: the ticks
+      live in `.git/gitcraft/prestage`, not in git's index.
+- [ ] Put junk in `.git/gitcraft/prestage` and reopen the repository: the status bar says the saved
+      ticks were damaged, the file is renamed to `prestage.damaged`, and everything starts ticked.
+- [ ] Ticking or unticking doesn't flash "Loading…" in the status bar.
+
 ## Commit tab: right-click menu
 
 - [ ] Discard changes… asks first and names exactly what will be lost. Esc or a click outside cancels.

@@ -13,6 +13,7 @@ use gitcraft_git::{DEFAULT_LOG_LIMIT, DiffRequest, LogScope, Refs, Repo, Working
 use crate::commands::Command;
 use crate::files;
 use crate::graph::History;
+use crate::prestage::Prestage;
 use crate::settings::{LayoutPrefs, Prefs};
 use crate::ui::commit_tab::{self, Changes};
 use crate::ui::confirm::{self, Choice, Confirm};
@@ -71,6 +72,9 @@ struct OpenRepo {
     /// Another refresh was asked for while one was on its way: run it when that one arrives
     /// (so files changed meanwhile aren't missed, and refreshes never pile up).
     status_again: bool,
+    /// Where the pre-stage file is kept, once found (`None` if git couldn't say: then nothing is
+    /// saved, and the status bar says why).
+    prestage_path: Option<PathBuf>,
 }
 
 impl OpenRepo {
@@ -91,6 +95,7 @@ impl OpenRepo {
             changes: Changes::default(),
             status_loading: false,
             status_again: false,
+            prestage_path: None,
         }
     }
 
@@ -355,7 +360,30 @@ impl GitCraftApp {
                 if let Some(name) = saved.filter(|_| restore) {
                     self.select_scope(LogScope::Ref(name));
                 }
+                // The saved ticks are asked for before the file list, so (the worker runs jobs in
+                // order) they are known when the list arrives.
+                if let Some(repo) = self.open.as_ref().map(|open| open.repo.clone()) {
+                    self.send(Job::LoadPrestage { repo });
+                }
                 self.refresh_status();
+            }
+            Event::PrestageLoaded { repo, path, result } => {
+                if let Some(open) = self.open.as_mut().filter(|open| open.repo == repo) {
+                    open.prestage_path = path;
+                    match result {
+                        Ok(prestage) => open.changes.load_prestage(prestage),
+                        Err(message) => {
+                            // Start from everything ticked (a damaged file was moved aside).
+                            open.changes.load_prestage(Prestage::default());
+                            self.error = Some(message);
+                        }
+                    }
+                }
+            }
+            Event::PrestageSaved { result } => {
+                if let Err(message) = result {
+                    self.error = Some(message);
+                }
             }
             Event::StatusLoaded { repo, result } => {
                 let Some(open) = self.open.as_mut().filter(|open| open.repo == repo) else {
@@ -397,9 +425,20 @@ impl GitCraftApp {
                 match result {
                     Ok(_) => {
                         open.changes.committed();
+                        // Saved before the repository is read again (jobs run in order), so the
+                        // fresh read finds what was left out still left out.
+                        let save = match (open.changes.after_commit(), open.prestage_path.clone()) {
+                            (Some(prestage), Some(path)) => Some(Job::SavePrestage { path, prestage }),
+                            _ => None,
+                        };
                         // The new commit changes the branch, the history and the working tree:
                         // read the whole repository again (the saved branch is kept).
                         let root = open.repo.root().to_path_buf();
+                        // `open` (a borrow of `self.open`) is no longer used past here, so `self`
+                        // can be borrowed again to send the jobs.
+                        if let Some(job) = save {
+                            self.send(job);
+                        }
                         self.open_folder(root);
                     }
                     Err(error) => {
@@ -696,6 +735,7 @@ impl GitCraftApp {
             }
             None => {}
         }
+        self.save_prestage_if_changed();
         about::show(ui.ctx(), &mut self.about_open);
         self.show_confirmation(ui.ctx());
         self.remember_layout();
@@ -783,17 +823,13 @@ impl GitCraftApp {
         let Some(open) = self.open.as_mut() else {
             return;
         };
-        let request = match open.changes.commit_request() {
-            None => return, // The button is disabled; nothing to do.
-            Some(Ok(request)) => request,
-            Some(Err(message)) => {
-                // A file's picked lines can't make a patch: say why, commit nothing.
-                open.changes.commit_error = Some(format!("The commit was not made: {message}"));
-                return;
-            }
+        // `None` when the button is disabled: nothing to do. (A patch that can't be built is
+        // reported by the worker, through the commit's result.)
+        let Some(plan) = open.changes.commit_plan() else {
+            return;
         };
         let pushed_to = open.changes.amend_info.as_ref().and_then(|info| info.pushed_to.as_deref());
-        if let (true, false, Some(remote)) = (request.amend, confirmed, pushed_to) {
+        if let (true, false, Some(remote)) = (plan.request.amend, confirmed, pushed_to) {
             let remote = remote.strip_prefix("refs/remotes/").unwrap_or(remote);
             self.confirm = Some(Pending::AmendPushed(Confirm {
                 title: "Amend a pushed commit?".into(),
@@ -808,8 +844,22 @@ impl GitCraftApp {
         }
         open.changes.committing = true;
         open.changes.commit_error = None;
-        let job = Job::Commit { repo: open.repo.clone(), request };
+        let job = Job::Commit { repo: open.repo.clone(), plan };
         self.send(job);
+    }
+
+    /// Writes the pre-stage file (in the background) when the ticks have changed. Called every
+    /// frame; it only does work after a change.
+    fn save_prestage_if_changed(&mut self) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let Some(path) = open.prestage_path.clone() else {
+            return;
+        };
+        if let Some(prestage) = open.changes.take_save() {
+            self.send(Job::SavePrestage { path, prestage });
+        }
     }
 
     /// Saves the dividers and "More info" when they change (a drag changes them every frame;
@@ -1039,7 +1089,7 @@ mod tests {
         run_frame(app, ctx, egui::RawInput::default()); // the dialog is "shown" at the end of this frame
         wait_until(|| {
             run_frame(app, ctx, egui::RawInput::default());
-            !app.is_busy()
+            !has_work(app)
         });
     }
 
@@ -1129,10 +1179,15 @@ mod tests {
     }
 
     /// Runs frames until the background worker has nothing left to do.
+    /// Whether the worker has anything left to do, quiet jobs (saves, folder checks) included.
+    fn has_work(app: &GitCraftApp) -> bool {
+        app.worker.as_ref().is_some_and(Worker::has_work)
+    }
+
     fn settle(app: &mut GitCraftApp, ctx: &egui::Context) {
         wait_until(|| {
             run_frame(app, ctx, egui::RawInput::default());
-            !app.is_busy()
+            !has_work(app)
         });
     }
 
@@ -1783,7 +1838,78 @@ mod tests {
         assert_eq!(repo.git(&["show", "HEAD:f.txt"]) + "\n", committed);
         assert_eq!(std::fs::read_to_string(repo.path().join("f.txt")).unwrap(), edited, "the file on disk is untouched");
         assert_eq!(changed_paths(&app), ["f.txt"], "line 11 is still waiting");
-        assert_eq!(changes(&mut app).tick("f.txt"), commit_tab::Tick::All, "what is left starts ticked again");
+        assert_eq!(changes(&mut app).tick("f.txt"), commit_tab::Tick::Nothing, "what is left is what was left out, so it stays out");
+    }
+
+    /// Settings shared by an app and its "restart", with the folder the pre-stage file is in.
+    fn restart(app: &GitCraftApp) -> (egui::Context, GitCraftApp) {
+        let ctx = egui::Context::default();
+        let mut restarted = app_with_prefs(&ctx, app.settings.get().clone());
+        settle(&mut restarted, &ctx);
+        (ctx, restarted)
+    }
+
+    #[test]
+    fn unticked_files_and_lines_survive_a_restart() {
+        let repo = TestRepo::with_commits(&[]);
+        let lines: String = (1..=12).map(|n| format!("{n}\n")).collect();
+        repo.commit_files(&[("f.txt", &lines), ("other.txt", "o\n")], "Root");
+        let edited: String = (1..=12)
+            .map(|n| match n {
+                2 => "two\n".to_string(),
+                11 => "eleven\n".to_string(),
+                _ => format!("{n}\n"),
+            })
+            .collect();
+        std::fs::write(repo.path().join("f.txt"), &edited).unwrap();
+        std::fs::write(repo.path().join("other.txt"), "o2\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.tab = MainTab::Commit;
+        settle(&mut app, &ctx);
+
+        // Untick a whole file, and the second hunk of the other.
+        changes(&mut app).set_tick("other.txt", commit_tab::Tick::Nothing);
+        changes(&mut app).click_tick(diff_view::TickClick { target: diff_view::TickTarget::Hunk(1), shift: false });
+        settle(&mut app, &ctx);
+        let file = repo.path().join(".git").join("gitcraft").join("prestage");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.starts_with("gitcraft-prestage 1\n") && text.contains("file\tother.txt\n"), "{text}");
+        assert_eq!(repo.git(&["diff", "--cached", "--name-only"]), "", "git's index is untouched");
+
+        let (ctx, mut restarted) = restart(&app);
+        restarted.tab = MainTab::Commit;
+        settle(&mut restarted, &ctx);
+        assert_eq!(changes(&mut restarted).tick("other.txt"), commit_tab::Tick::Nothing);
+        assert_eq!(changes(&mut restarted).tick("f.txt"), commit_tab::Tick::Lines);
+        // Committing straight away, without opening f.txt's diff, takes only the first hunk.
+        changes(&mut restarted).summary = "Only two".into();
+        restarted.start_commit(false);
+        settle(&mut restarted, &ctx);
+        let committed: String = (1..=12).map(|n| if n == 2 { "two\n".to_string() } else { format!("{n}\n") }).collect();
+        assert_eq!(repo.git(&["show", "HEAD:f.txt"]) + "\n", committed);
+        assert_eq!(repo.git(&["show", "HEAD:other.txt"]), "o", "the unticked file wasn't committed");
+    }
+
+    #[test]
+    fn a_damaged_prestage_file_is_reported_and_set_aside() {
+        let repo = TestRepo::with_commits(&["Root"]);
+        std::fs::write(repo.path().join("new.txt"), "n\n").unwrap();
+        let folder = repo.path().join(".git").join("gitcraft");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("prestage"), "not a prestage file\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.tab = MainTab::Commit;
+        settle(&mut app, &ctx);
+        match app.status_line() {
+            StatusLine::Error(message) => assert!(message.contains("damaged"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        assert!(folder.join("prestage.damaged").exists());
+        assert_eq!(changes(&mut app).tick("new.txt"), commit_tab::Tick::All);
     }
 
     #[test]

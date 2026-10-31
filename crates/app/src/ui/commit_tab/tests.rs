@@ -1,6 +1,8 @@
 use super::*;
 use gitcraft_git::{Change, EntryKind};
 
+use crate::prestage::{Prestage, Saved};
+
 fn entry(path: &str, kind: EntryKind, staged: Change, unstaged: Change) -> StatusEntry {
     StatusEntry { path: path.into(), old_path: None, kind, staged, unstaged, submodule: false }
 }
@@ -24,9 +26,9 @@ fn sample() -> Changes {
     changes
 }
 
-/// A request that must be possible.
+/// The whole-file part of a commit that must be possible.
 fn request(changes: &Changes) -> CommitRequest {
-    changes.commit_request().expect("not blocked").expect("patches build")
+    changes.commit_plan().expect("not blocked").request
 }
 
 #[test]
@@ -69,7 +71,7 @@ fn refreshes_keep_choices_and_forget_files_that_are_gone() {
 fn commit_requests_follow_the_ticks() {
     let mut changes = sample();
     assert_eq!(changes.blocker(), Some("Write a summary first."));
-    assert_eq!(changes.commit_request(), None);
+    assert!(changes.commit_plan().is_none());
 
     changes.summary = "  Fix login  ".into();
     changes.description = "Long story.\n\n".into();
@@ -287,10 +289,14 @@ fn picked_lines_go_into_the_commit_as_a_patch() {
     let mut changes = with_diff(PATCH);
     changes.summary = "Part".into();
     changes.click_tick(TickClick { target: TickTarget::Hunk(1), shift: false }); // leave out "eleven"
-    let request = request(&changes);
-    assert_eq!(request.include, ["b.txt", "c.txt"]);
-    assert_eq!(request.partial.len(), 1);
-    let patch = String::from_utf8(request.partial[0].patch.clone()).unwrap();
+    let plan = changes.commit_plan().unwrap();
+    assert_eq!(plan.request.include, ["b.txt", "c.txt"]);
+    assert!(plan.request.partial.is_empty(), "patches are built by the worker");
+    assert_eq!(plan.partial.len(), 1);
+    assert_eq!(plan.partial[0].path, "a.txt");
+    assert!(!plan.partial[0].new_file);
+    let file = plan.partial[0].picks.patch(&FileDiff::parse(PATCH.as_bytes()), "a.txt").unwrap().unwrap();
+    let patch = String::from_utf8(file.patch).unwrap();
     assert!(patch.contains("+TWO") && !patch.contains("ELEVEN"), "{patch}");
 }
 
@@ -302,7 +308,8 @@ fn a_patch_that_cant_be_built_is_an_error_not_a_crash() {
     changes.summary = "x".into();
     changes.set_tick("a.txt", Tick::Nothing);
     click_line(&mut changes, 0, 3, false); // only "+more"
-    let error = changes.commit_request().expect("not blocked").expect_err("refused");
+    let plan = changes.commit_plan().expect("not blocked");
+    let error = plan.partial[0].picks.patch(&FileDiff::parse(patch.as_bytes()), "a.txt").expect_err("refused");
     assert!(error.starts_with("a.txt: ") && error.contains("ticked together"), "{error}");
 }
 
@@ -326,6 +333,69 @@ fn a_diff_that_can_no_longer_be_split_leaves_the_file_out() {
     changes.diff_loaded("a.txt", FileDiff { binary: true, ..FileDiff::default() });
     assert_eq!(changes.tick("a.txt"), Tick::Nothing);
     assert!(changes.partial.is_empty());
+}
+
+// --- Pre-staging (saving the ticks) ---
+
+#[test]
+fn ticks_survive_a_round_trip_through_the_prestage() {
+    let mut before = with_diff(PATCH);
+    before.set_tick("b.txt", Tick::Nothing);
+    click_line(&mut before, 1, 2, false); // leave out "+ELEVEN"
+    let saved = before.snapshot();
+    assert_eq!(saved.files.len(), 2);
+    assert_eq!(saved.files["b.txt"], Saved::File);
+
+    // A restart: the file is read before the list arrives.
+    let mut after = Changes::default();
+    after.load_prestage(Prestage::parse(&saved.to_text()).unwrap());
+    after.set_status(status(vec![unstaged("a.txt"), entry("b.txt", EntryKind::Untracked, Change::Unmodified, Change::Added), unstaged("new.txt")]));
+    assert_eq!(after.tick("b.txt"), Tick::Nothing);
+    assert_eq!(after.tick("a.txt"), Tick::Lines);
+    assert_eq!(after.tick("new.txt"), Tick::All, "a change not in the pre-stage starts ticked");
+    after.selected = Some("a.txt".into());
+    after.diff_loaded("a.txt", FileDiff::parse(PATCH.as_bytes()));
+    assert!(!after.line_ticked("a.txt", line(1, 2)), "the unticked line is unticked again");
+    assert!(after.line_ticked("a.txt", line(0, 2)));
+}
+
+#[test]
+fn a_prestage_arriving_after_the_list_still_applies() {
+    let mut changes = sample();
+    let mut files = std::collections::BTreeMap::new();
+    files.insert("b.txt".to_string(), Saved::File);
+    files.insert("gone.txt".to_string(), Saved::File);
+    changes.load_prestage(Prestage { files });
+    assert_eq!(changes.tick("b.txt"), Tick::Nothing);
+    assert!(!changes.snapshot().files.contains_key("gone.txt"), "files no longer changed are dropped");
+}
+
+#[test]
+fn saves_only_after_loading_and_only_when_something_changed() {
+    let mut changes = sample();
+    changes.set_tick("a.txt", Tick::Nothing);
+    assert_eq!(changes.take_save(), None, "the file hasn't been read yet: never overwrite it");
+
+    changes.load_prestage(Prestage::default());
+    let saved = changes.take_save().expect("a.txt is left out");
+    assert_eq!(saved.files["a.txt"], Saved::File);
+    assert_eq!(changes.take_save(), None, "nothing changed since");
+
+    changes.set_tick("a.txt", Tick::Nothing);
+    assert_eq!(changes.take_save(), None, "same as saved");
+    changes.set_tick("a.txt", Tick::All);
+    assert_eq!(changes.take_save(), Some(Prestage::default()), "back to everything ticked");
+}
+
+#[test]
+fn after_a_commit_partly_committed_files_are_left_out() {
+    let mut changes = with_diff(PATCH);
+    changes.load_prestage(Prestage::default());
+    click_line(&mut changes, 1, 2, false);
+    let _ = changes.take_save();
+    let saved = changes.after_commit().expect("changed");
+    assert_eq!(changes.tick("a.txt"), Tick::Nothing, "what is left is what was left out");
+    assert_eq!(saved.files["a.txt"], Saved::File);
 }
 
 #[test]

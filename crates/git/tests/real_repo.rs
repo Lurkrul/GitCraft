@@ -82,6 +82,29 @@ fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 #[test]
+fn git_paths_point_into_the_git_folder_even_in_a_worktree() {
+    let repo = TestRepo::new();
+    repo.commit("Root");
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    let path = git.git_path(&opened, "gitcraft/prestage").unwrap();
+    assert_eq!(path, opened.root().join(".git").join("gitcraft").join("prestage"));
+
+    // A linked worktree has its own git folder (its `.git` is a file pointing there).
+    let worktree_dir = tempfile::tempdir().unwrap();
+    let worktree = worktree_dir.path().join("wt");
+    repo.git(&["worktree", "add", "-q", "-b", "side", worktree.to_str().unwrap()]);
+    let opened_worktree = git.open_repo(&worktree).unwrap();
+    let in_worktree = git.git_path(&opened_worktree, "gitcraft/prestage").unwrap();
+    assert!(in_worktree.ends_with(Path::new("worktrees").join("wt").join("gitcraft").join("prestage")), "{}", in_worktree.display());
+    assert!(in_worktree.is_absolute());
+
+    for bad in ["", "../escape", "/abs"] {
+        assert!(git.git_path(&opened, bad).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
 fn opens_a_repository_from_its_top_folder_or_a_subfolder() {
     let repo = TestRepo::new();
     let sub: PathBuf = repo.path().join("src").join("deep");

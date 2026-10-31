@@ -7,6 +7,7 @@ mod app;
 mod commands;
 mod files;
 mod graph;
+mod prestage;
 mod settings;
 #[cfg(test)]
 mod test_support;

@@ -168,8 +168,8 @@ exactly like the command line. Submodules as designed (G7).
 | G2 | File checkboxes, summary/description, Commit (Ctrl+Enter), Amend; hook output on failure | done |
 | G2b | Commit tab rows (checkbox, path, letter) and the file right-click menu | done |
 | G3a | Pure patch builder for chosen lines; committing partial files with `git apply --cached` | done |
-| G3b | Line and hunk checkboxes in the Commit tab's diff (ticks in memory) | done, not committed |
-| G3c | Pre-staging: ticks saved in `.git/gitcraft/prestage`, surviving restarts | next |
+| G3b | Line and hunk checkboxes in the Commit tab's diff (ticks in memory) | done (`86291a9`) |
+| G3c | Pre-staging: ticks saved in `.git/gitcraft/prestage`, surviving restarts | done, not committed |
 | G4 | Discard single hunks and lines (whole files are done in G2b) | |
 | G5 | Branches: new, checkout, rename, delete (with confirmations) | |
 | G6 | Repository menu: fetch, pull, push on a second worker; cancel; `--force-with-lease` only | |
@@ -294,6 +294,25 @@ Recent repositories (added on request, alongside G3b):
 - Which folders are missing is checked on the worker thread (a disconnected network drive can stall),
   when the list changes and when the window gets the focus back. The menu is laid out again only
   when the list changes.
+
+G3c details:
+- Git layer: `git_path(repo, name)` (`rev-parse --git-path`), right in worktrees and submodules too.
+- `prestage.rs`: the data (`Prestage`: per path, the whole file or a set of `LineKey`s), a small
+  tab-separated text format with a version header and escaped paths, `load` and `save`. Line keys
+  now hold an FNV-1a hash of the text instead of the text. Limits: 16 MiB, a million records. A file
+  that doesn't parse is moved to `prestage.damaged` and reported; everything then starts ticked.
+  Saves go to a temporary file and are renamed over the old one; an empty pre-stage deletes the file.
+- Loading: when a repository opens, `LoadPrestage` is sent before the status (the worker runs jobs
+  in order). Saved picks for files not in the list yet wait in `Changes::pending`; entries for
+  files no longer changed are dropped. Nothing is saved until the file has been read.
+- Saving: `Changes` counts edits; each frame `take_save` compares a snapshot with what was last
+  saved and, if it differs, `SavePrestage` writes it in the background.
+- Worker jobs the user doesn't wait for (saves, folder checks) are "quiet": they don't show
+  "Loading…" in the status bar.
+- Commit: `commit_plan()` lists whole files and partly ticked files; the worker reads each partial
+  file's diff again, moves the picks onto it and builds the patch (so picks restored from the file
+  work without opening the diff first). After a successful commit, partly committed files become
+  fully unticked: what is left of them is what was left out.
 
 ## Feature checklist
 

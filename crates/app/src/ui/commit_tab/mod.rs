@@ -17,10 +17,11 @@ use std::path::PathBuf;
 use craft_ui::layout::SplitAxis;
 use gitcraft_git::{AmendInfo, CommitRequest, FileDiff, LineRef, MAX_STATUS_ENTRIES, Status, StatusEntry, WorkingChange};
 
+use crate::prestage::{Prestage, Saved};
 use crate::ui::diff_view::{self, DiffState, DiffView, TickClick, TickTarget, Ticks};
 use crate::ui::file_row;
 use crate::ui::split::{self, Split};
-use ticks::Partial;
+pub use ticks::Partial;
 
 /// Whether a file goes into the next commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +60,34 @@ pub struct Changes {
     pub committing: bool,
     /// Why the last commit failed (a hook's output, say).
     pub commit_error: Option<String>,
+    /// Pre-staging read from the file for files not in the list yet; applied when they appear.
+    pending: BTreeMap<String, Saved>,
+    /// The pre-stage file has been read (until then nothing is saved, so it isn't overwritten).
+    prestage_loaded: bool,
+    /// Counts changes to the ticks, so [`Changes::take_save`] only looks when something changed.
+    edits: u64,
+    saved_edits: u64,
+    /// What was last saved (or read), so an unchanged pre-stage isn't written again.
+    last_saved: Option<Prestage>,
+}
+
+/// What to commit, for the background worker. Files with picked lines get their patch built
+/// there, from a fresh diff, since their diff may never have been read (picks restored from the
+/// pre-stage file) or may be out of date.
+#[derive(Debug, Clone)]
+pub struct CommitPlan {
+    /// Whole files to include or leave out, the message and Amend. Its `partial` is empty.
+    pub request: CommitRequest,
+    pub partial: Vec<PartialPlan>,
+}
+
+/// A file committed in part.
+#[derive(Debug, Clone)]
+pub struct PartialPlan {
+    pub path: String,
+    /// The file isn't in HEAD (its diff compares it with nothing).
+    pub new_file: bool,
+    pub picks: Partial,
 }
 
 /// Something the user did in the tab that the app has to act on.
@@ -105,15 +134,86 @@ impl Changes {
     }
 
     /// Takes in a freshly read status: files seen for the first time start ticked (whatever git's
-    /// index holds), files no longer changed are forgotten, and the rest keep the user's choice.
+    /// index holds) unless the pre-stage file leaves them out, files no longer changed are
+    /// forgotten, and the rest keep the user's choice.
     pub fn set_status(&mut self, status: Status) {
         let still_changed = |path: &String| status.entries.iter().any(|entry| &entry.path == path);
         self.ticks.retain(|path, _| still_changed(path));
         self.partial.retain(|path, _| still_changed(path));
         for entry in &status.entries {
-            self.ticks.entry(entry.path.clone()).or_insert(Tick::All);
+            if self.ticks.contains_key(&entry.path) {
+                continue;
+            }
+            match self.pending.remove(&entry.path) {
+                Some(saved) => self.apply_saved(&entry.path, saved),
+                None => {
+                    self.ticks.insert(entry.path.clone(), Tick::All);
+                }
+            }
+        }
+        if self.prestage_loaded {
+            // Saved entries for files that aren't changed any more are dropped.
+            self.pending.clear();
         }
         self.status = Some(status);
+        self.edits += 1;
+    }
+
+    /// Takes in the pre-stage file's contents (read when the repository opened).
+    pub fn load_prestage(&mut self, prestage: Prestage) {
+        for (path, saved) in prestage.files.clone() {
+            if self.entry(&path).is_some() {
+                self.apply_saved(&path, saved);
+            } else if self.status.is_none() {
+                // The list hasn't been read yet: wait for it.
+                self.pending.insert(path, saved);
+            }
+        }
+        self.prestage_loaded = true;
+        self.last_saved = Some(prestage);
+        self.edits += 1;
+    }
+
+    fn apply_saved(&mut self, path: &str, saved: Saved) {
+        match saved {
+            Saved::File => self.set_tick(path, Tick::Nothing),
+            Saved::Lines(keys) => {
+                self.partial.insert(path.to_string(), Partial::from_saved(keys));
+                self.ticks.insert(path.to_string(), Tick::Lines);
+                self.edits += 1;
+            }
+        }
+    }
+
+    /// The pre-stage as it is now: what is left out of each changed file.
+    pub fn snapshot(&self) -> Prestage {
+        let mut prestage = Prestage::default();
+        for entry in self.entries() {
+            let saved = match self.tick(&entry.path) {
+                Tick::All => None,
+                Tick::Nothing => Some(Saved::File),
+                Tick::Lines => self.partial.get(&entry.path).map(|partial| Saved::Lines(partial.unticked().clone())),
+            };
+            if let Some(saved) = saved {
+                prestage.files.insert(entry.path.clone(), saved);
+            }
+        }
+        prestage
+    }
+
+    /// The pre-stage to write, if it changed since it was last saved. Nothing is saved before the
+    /// file has been read and the list is known, so an earlier choice is never overwritten.
+    pub fn take_save(&mut self) -> Option<Prestage> {
+        if !self.prestage_loaded || self.status.is_none() || self.edits == self.saved_edits {
+            return None;
+        }
+        self.saved_edits = self.edits;
+        let snapshot = self.snapshot();
+        if self.last_saved.as_ref() == Some(&snapshot) {
+            return None;
+        }
+        self.last_saved = Some(snapshot.clone());
+        Some(snapshot)
     }
 
     pub fn tick(&self, path: &str) -> Tick {
@@ -124,6 +224,7 @@ impl Changes {
     pub fn set_tick(&mut self, path: &str, tick: Tick) {
         self.partial.remove(path);
         self.ticks.insert(path.to_string(), tick);
+        self.edits += 1;
     }
 
     fn entries(&self) -> &[StatusEntry] {
@@ -136,13 +237,15 @@ impl Changes {
         for value in self.ticks.values_mut() {
             *value = tick;
         }
+        self.edits += 1;
     }
 
     /// A freshly read diff for `path` arrived: show it, and move that file's picked lines onto it.
     pub fn diff_loaded(&mut self, path: &str, diff: FileDiff) {
         if let Some(partial) = self.partial.get_mut(path) {
+            self.edits += 1;
             if diff.can_pick_lines() {
-                partial.remap(diff.clone());
+                partial.remap(&diff);
                 self.normalize(path);
             } else {
                 // The file can no longer be split (it became binary or too large): leave it out
@@ -215,13 +318,14 @@ impl Changes {
             (Tick::Lines, Some(partial)) => partial,
             (Tick::Nothing, _) => {
                 let all = ticks::line_keys(&view.diff).into_iter().map(|(_, key)| key).collect();
-                Partial::new(view.diff.clone(), all)
+                Partial::new(&view.diff, all)
             }
-            _ => Partial::new(view.diff.clone(), BTreeSet::new()),
+            _ => Partial::new(&view.diff, BTreeSet::new()),
         };
         partial.set(&lines, ticked);
         self.partial.insert(path.clone(), partial);
         self.ticks.insert(path.clone(), Tick::Lines);
+        self.edits += 1;
         self.normalize(&path);
     }
 
@@ -260,27 +364,34 @@ impl Changes {
         }
     }
 
-    /// What to commit: `None` if Commit can't be clicked, or an error if a file's picked lines
-    /// can't be turned into a patch.
-    pub fn commit_request(&self) -> Option<Result<CommitRequest, String>> {
+    /// What to commit, or `None` if Commit can't be clicked.
+    pub fn commit_plan(&self) -> Option<CommitPlan> {
         if self.blocker().is_some() {
             return None;
         }
+        let unborn = self.status.as_ref().is_some_and(|status| status.unborn);
         let mut request = CommitRequest { include: Vec::new(), exclude: Vec::new(), partial: Vec::new(), message: self.message(), amend: self.amend };
+        let mut partial = Vec::new();
         for entry in self.entries() {
             let path = entry.path.clone();
-            match self.tick(&path) {
-                Tick::All => request.include.push(path),
-                Tick::Nothing => request.exclude.push(path),
-                Tick::Lines => match self.partial.get(&path).map(|partial| partial.patch(&path)) {
-                    Some(Ok(Some(file))) => request.partial.push(file),
-                    // Nothing picked after all: leave the file out.
-                    Some(Ok(None)) | None => request.exclude.push(path),
-                    Some(Err(message)) => return Some(Err(message)),
-                },
+            match (self.tick(&path), self.partial.get(&path)) {
+                (Tick::All, _) => request.include.push(path),
+                (Tick::Nothing, _) | (Tick::Lines, None) => request.exclude.push(path),
+                (Tick::Lines, Some(picks)) => partial.push(PartialPlan { path, new_file: entry.is_new() || unborn, picks: picks.clone() }),
             }
         }
-        Some(Ok(request))
+        Some(CommitPlan { request, partial })
+    }
+
+    /// After a successful commit, what is left of a file committed in part is exactly what was
+    /// left out, so the whole file is now unticked (and stays so after a restart). Returns the
+    /// pre-stage to save, if it changed.
+    pub fn after_commit(&mut self) -> Option<Prestage> {
+        let partly: Vec<String> = self.partial.keys().cloned().collect();
+        for path in partly {
+            self.set_tick(&path, Tick::Nothing);
+        }
+        self.take_save()
     }
 
     /// Starts an amend from the last commit's message, unless the user has already written one.

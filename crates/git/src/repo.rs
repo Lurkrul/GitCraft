@@ -36,4 +36,25 @@ impl Git {
         }
         Ok(Repo { root: platform::path_from_git_output(output)? })
     }
+
+    /// Where a file of GitCraft's own lives inside the repository's git folder, such as
+    /// `gitcraft/prestage` → `<repo>/.git/gitcraft/prestage`. Asking git (`rev-parse --git-path`)
+    /// gives the right place in linked worktrees and submodules too, where `.git` is a file.
+    /// `name` must be a plain relative path (no `..`, not absolute).
+    pub fn git_path(&self, repo: &Repo, name: &str) -> Result<PathBuf> {
+        let plain = !name.is_empty() && Path::new(name).components().all(|part| matches!(part, std::path::Component::Normal(_)));
+        if !plain {
+            return Err(GitError::Malformed { what: "git path".into(), detail: format!("{name:?} is not a plain relative path") });
+        }
+        let mut output = self.run(repo.root(), &["rev-parse", "--git-path", name])?;
+        while output.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+            output.pop();
+        }
+        if output.is_empty() {
+            return Err(GitError::Malformed { what: "rev-parse --git-path".into(), detail: "empty path".into() });
+        }
+        let path = platform::path_from_git_output(output)?;
+        // Git answers relative to the folder it ran in (the top of the working tree).
+        Ok(if path.is_absolute() { path } else { repo.root().join(path) })
+    }
 }

@@ -12,12 +12,13 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
 use gitcraft_git::{
-    AmendInfo, CommitDetails, CommitRequest, DEFAULT_LOG_LIMIT, DiffRequest, FileDiff, Git, GitError, LogScope, Refs, Repo, Status,
-    WorkingDiffRequest,
+    AmendInfo, CommitDetails, DEFAULT_LOG_LIMIT, DiffRequest, FileDiff, Git, GitError, LogScope, Refs, Repo, Status, WorkingDiffRequest,
 };
 
 use crate::files;
 use crate::graph::History;
+use crate::prestage::{self, Prestage};
+use crate::ui::commit_tab::CommitPlan;
 
 /// Called by the worker after each event, to make the UI repaint (and so poll) right away.
 /// `Arc<dyn Fn ...>` is a shared, thread-safe function object, like `std::shared_ptr<std::function<void()>>`.
@@ -39,8 +40,12 @@ pub enum Job {
     LoadStatus { repo: Repo },
     /// Read one changed file's diff from HEAD to the working tree.
     LoadWorkingDiff { repo: Repo, request: WorkingDiffRequest },
-    /// Commit the chosen changes.
-    Commit { repo: Repo, request: CommitRequest },
+    /// Commit the chosen changes (patches for partly ticked files are built here, from fresh diffs).
+    Commit { repo: Repo, plan: CommitPlan },
+    /// Find and read the repository's pre-stage file.
+    LoadPrestage { repo: Repo },
+    /// Write the pre-stage file (at the path found by `LoadPrestage`).
+    SavePrestage { path: PathBuf, prestage: Prestage },
     /// Read the last commit's message and whether it was pushed, for Amend.
     LoadAmendInfo { repo: Repo },
     /// Throw away a changed file's changes: the file goes to the Recycle Bin first, then (if git
@@ -133,6 +138,30 @@ pub enum Event {
     FoldersChecked {
         missing: BTreeSet<PathBuf>,
     },
+    /// The pre-stage file's location (if git could say) and contents, or why it couldn't be read.
+    PrestageLoaded {
+        repo: Repo,
+        path: Option<PathBuf>,
+        result: Result<Prestage, String>,
+    },
+    /// The pre-stage file was written, or why not.
+    PrestageSaved {
+        result: Result<(), String>,
+    },
+}
+
+impl Job {
+    /// Small background chores the user doesn't wait for: they don't make the app look busy.
+    fn is_quiet(&self) -> bool {
+        matches!(self, Job::CheckFolders(_) | Job::SavePrestage { .. })
+    }
+}
+
+impl Event {
+    /// The events of quiet jobs (see `Job::is_quiet`).
+    fn is_quiet(&self) -> bool {
+        matches!(self, Event::FoldersChecked { .. } | Event::PrestageSaved { .. })
+    }
 }
 
 /// The UI's handle on the background thread. Dropping it closes the job channel, which ends the
@@ -140,8 +169,9 @@ pub enum Event {
 pub struct Worker {
     jobs: Sender<Job>,
     events: Receiver<Event>,
-    /// Jobs sent whose events haven't come back yet.
+    /// Jobs sent whose events haven't come back yet (quiet ones counted apart).
     pending: usize,
+    quiet_pending: usize,
     /// False once the thread has gone away (it should only stop if it panics).
     alive: bool,
 }
@@ -154,13 +184,18 @@ impl Worker {
         // `move` hands the receiving end of the job channel and the sending end of the event
         // channel to the new thread; the UI keeps the other two ends.
         thread::Builder::new().name("gitcraft-git".into()).spawn(move || run(job_receiver, event_sender, wake))?;
-        Ok(Worker { jobs: job_sender, events: event_receiver, pending: 0, alive: true })
+        Ok(Worker { jobs: job_sender, events: event_receiver, pending: 0, quiet_pending: 0, alive: true })
     }
 
     /// Queues a job. Returns false if the worker has stopped.
     pub fn send(&mut self, job: Job) -> bool {
+        let quiet = job.is_quiet();
         if self.jobs.send(job).is_ok() {
-            self.pending += 1;
+            if quiet {
+                self.quiet_pending += 1;
+            } else {
+                self.pending += 1;
+            }
             true
         } else {
             self.alive = false;
@@ -174,7 +209,11 @@ impl Worker {
         loop {
             match self.events.try_recv() {
                 Ok(event) => {
-                    self.pending = self.pending.saturating_sub(1);
+                    if event.is_quiet() {
+                        self.quiet_pending = self.quiet_pending.saturating_sub(1);
+                    } else {
+                        self.pending = self.pending.saturating_sub(1);
+                    }
                     events.push(event);
                 }
                 Err(TryRecvError::Empty) => break,
@@ -182,6 +221,7 @@ impl Worker {
                     // The thread has ended, so nothing still pending will ever arrive.
                     self.alive = false;
                     self.pending = 0;
+                    self.quiet_pending = 0;
                     break;
                 }
             }
@@ -189,9 +229,15 @@ impl Worker {
         events
     }
 
-    /// True while a job is running or queued.
+    /// True while a job the user waits for is running or queued.
     pub fn is_busy(&self) -> bool {
         self.pending > 0
+    }
+
+    /// True while any job, quiet ones included, is running or queued (for tests).
+    #[cfg(test)]
+    pub fn has_work(&self) -> bool {
+        self.pending > 0 || self.quiet_pending > 0
     }
 
     pub fn is_alive(&self) -> bool {
@@ -232,9 +278,23 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, wake: Wake) {
                 let result = located(&mut git).and_then(|git| git.working_diff(&repo, &request));
                 Event::WorkingDiffLoaded { repo, request, result }
             }
-            Job::Commit { repo, request } => {
-                let result = located(&mut git).and_then(|git| git.commit(&repo, &request));
+            Job::Commit { repo, plan } => {
+                let result = located(&mut git).and_then(|git| commit(git, &repo, plan));
                 Event::Committed { repo, result }
+            }
+            Job::LoadPrestage { repo } => match located(&mut git).and_then(|git| git.git_path(&repo, prestage::FILE_NAME)) {
+                Ok(path) => {
+                    let result = prestage::load(&path);
+                    Event::PrestageLoaded { repo, path: Some(path), result }
+                }
+                Err(error) => {
+                    Event::PrestageLoaded { repo, path: None, result: Err(format!("Could not find where to keep GitCraft's ticks: {error}")) }
+                }
+            },
+            Job::SavePrestage { path, prestage } => {
+                let result =
+                    prestage::save(&path, &prestage).map_err(|error| format!("Could not save GitCraft's ticks ({}): {error}", path.display()));
+                Event::PrestageSaved { result }
             }
             Job::LoadAmendInfo { repo } => {
                 let result = located(&mut git).and_then(|git| git.amend_info(&repo));
@@ -256,6 +316,27 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, wake: Wake) {
         }
         wake();
     }
+}
+
+/// Commits a plan: each partly ticked file's diff is read again and its picks moved onto it, so
+/// the patch matches the file as it is now; then the whole request goes to git.
+fn commit(git: &Git, repo: &Repo, plan: CommitPlan) -> Result<String, GitError> {
+    let mut request = plan.request;
+    for file in plan.partial {
+        let diff = git.working_diff(repo, &WorkingDiffRequest { path: file.path.clone(), new_file: file.new_file })?;
+        if !diff.can_pick_lines() {
+            return Err(GitError::Unsupported(format!(
+                "{}: single lines can no longer be picked in this file (too many changes to show). Tick or untick the whole file.",
+                file.path
+            )));
+        }
+        match file.picks.patch(&diff, &file.path).map_err(GitError::Unsupported)? {
+            Some(partial) => request.partial.push(partial),
+            // Nothing ticked after all: leave the file out.
+            None => request.exclude.push(file.path),
+        }
+    }
+    git.commit(repo, &request)
 }
 
 /// Discards one file's changes. The file on disk goes to the Recycle Bin first; if that fails,
