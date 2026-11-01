@@ -22,6 +22,7 @@ use crate::ui::confirm::Confirm;
 use crate::ui::diff_view::{self, DiffAction, DiffState, DiffView, TickClick, TickTarget, Ticks};
 use crate::ui::file_row;
 use crate::ui::split::{self, Split};
+use crate::ui::submodules;
 use crate::ui::tabs::{self, RepoView};
 pub use ticks::Partial;
 
@@ -114,6 +115,8 @@ pub enum Action {
     },
     /// Something couldn't be done; the message says why (for the status bar).
     Problem(String),
+    /// "Open submodule" in a changed submodule's panel (its path).
+    OpenSubmodule(String),
 }
 
 /// The right-click menu of a changed file.
@@ -518,6 +521,9 @@ pub fn show(ui: &mut egui::Ui, changes: &mut Changes, ratio: &mut f32, view: &mu
     };
     // A deleted file has no lines on disk to discard (the whole-file discard covers it).
     let can_discard = changes.entry(&path).is_some_and(|entry| entry.change() != WorkingChange::Deleted);
+    // A submodule's "diff" is just its old and new commit: shown as a summary instead.
+    let submodule = changes.entry(&path).is_some_and(|entry| entry.submodule);
+    let mut open_submodule = false;
     let mut action = None;
     let mut clicked = None;
     split::two_panes(
@@ -542,11 +548,19 @@ pub fn show(ui: &mut egui::Ui, changes: &mut Changes, ratio: &mut f32, view: &mu
                     Tick::Lines => !unticked.contains(&at),
                 };
                 let ticks = Ticks { enabled: blocker.is_none(), disabled_reason: blocker.unwrap_or_default(), is_ticked: &is_ticked, can_discard };
-                clicked = diff_view::show(ui, &diff, ("working", shown.as_deref()), Some(&ticks));
+                match &diff {
+                    DiffState::Loaded(view) if submodule => {
+                        open_submodule = submodules::change_panel(ui, &path, &submodules::submodule_change(&view.diff));
+                    }
+                    _ => clicked = diff_view::show(ui, &diff, ("working", shown.as_deref()), Some(&ticks)),
+                }
             }
         },
     );
     changes.diff = diff;
+    if open_submodule {
+        action = action.or(Some(Action::OpenSubmodule(path.clone())));
+    }
     match clicked {
         Some(DiffAction::Tick(click)) => changes.click_tick(click),
         Some(DiffAction::Discard(target)) => action = action.or(changes.discard_action(target)),

@@ -25,6 +25,7 @@ use crate::ui::recent::{self, RecentItem, RepositoryPick};
 use crate::ui::ref_labels::{self, LabelMap};
 use crate::ui::repository::RepoLayout;
 use crate::ui::status_bar::StatusLine;
+use crate::ui::submodules::{self, SubmodulePick, SubmodulesWindow};
 use crate::ui::sync::{self, NetOp, SyncPick};
 use crate::ui::tabs::{MainTab, RepoView};
 use crate::ui::{about, menu, placeholder, repository, status_bar, tabs};
@@ -173,6 +174,14 @@ pub struct GitCraftApp {
     last_refs_check: Option<Instant>,
     /// A check is on its way (never more than one at a time).
     refs_check_running: bool,
+    /// The Submodules window, while open.
+    submodules_window: Option<SubmodulesWindow>,
+    /// The repositories above the open one, outermost first, while a submodule is open (the
+    /// "parent / submodule" trail). Empty for an ordinary repository.
+    breadcrumb: Vec<PathBuf>,
+    /// Set while a submodule or a parent is being opened: the trail to show once it opens. A
+    /// repository opened this way isn't added to the recent list.
+    open_intent: Option<Vec<PathBuf>>,
 }
 
 /// An action held back until the user confirms it.
@@ -187,6 +196,8 @@ enum Pending {
     DeleteBranch { name: String, question: Confirm },
     /// Force pushing (with lease).
     ForcePush(Confirm),
+    /// Updating a submodule to its recorded commit.
+    UpdateSubmodule { path: String, question: Confirm },
 }
 
 impl GitCraftApp {
@@ -217,6 +228,9 @@ impl GitCraftApp {
             net: None,
             last_refs_check: None,
             refs_check_running: false,
+            submodules_window: None,
+            breadcrumb: Vec::new(),
+            open_intent: None,
             dialogs: Dialogs::new(Arc::new(move || dialog_ctx.request_repaint())),
             open: None,
             error: worker_error.or(net_error).or(startup_problem),
@@ -252,6 +266,7 @@ impl GitCraftApp {
                 let open = self.open.as_ref().map(|open| open.repo.root().to_path_buf());
                 self.settings.update(|prefs| prefs.repositories.clear_except(open.as_deref()));
             }
+            Command::Submodules => self.show_submodules(),
             Command::Fetch => self.run_net(NetOp::Fetch),
             Command::Pull => self.run_net(NetOp::Pull),
             Command::Push => self.push(),
@@ -424,8 +439,15 @@ impl GitCraftApp {
                 // Show the branch picked last time, if it still exists; otherwise forget it.
                 let saved = self.settings.get().repositories.branch_for(&root).map(str::to_string);
                 let restore = saved.as_deref().is_some_and(|name| open.has_branch(name));
+                // A submodule (or a parent reached from one) keeps the trail and stays out of the
+                // recent list; anything else starts a fresh trail.
+                let intent = self.open_intent.take();
+                let ordinary = intent.is_none();
+                self.breadcrumb = intent.unwrap_or_default();
                 self.settings.update(|prefs| {
-                    prefs.repositories.opened(&root);
+                    if ordinary {
+                        prefs.repositories.opened(&root);
+                    }
                     if !restore {
                         prefs.repositories.set_branch(&root, None);
                     }
@@ -542,6 +564,11 @@ impl GitCraftApp {
                     }
                 }
             }
+            Event::SubmodulesLoaded { repo, result } => {
+                if let (Some(window), true) = (self.submodules_window.as_mut(), self.open.as_ref().is_some_and(|open| open.repo == repo)) {
+                    window.list = Some(result.map_err(|error| format!("Could not read the submodules: {error}")));
+                }
+            }
             Event::SyncLoaded { repo, result } => {
                 if let Some(open) = self.open.as_mut().filter(|open| open.repo == repo) {
                     match result {
@@ -567,6 +594,9 @@ impl GitCraftApp {
                 // halfway, a pull that stopped on a conflict): read it all again.
                 self.reload();
                 self.refresh_status();
+                if self.submodules_window.is_some() {
+                    self.load_submodules();
+                }
             }
             Event::UpstreamOnlyCounted { repo, result } => {
                 let Some(open) = self.open.as_ref().filter(|open| open.repo == repo) else {
@@ -685,7 +715,10 @@ impl GitCraftApp {
                 }
             }
             // The repository already on screen (if any) stays; the error explains what happened.
-            Event::OpenFailed { path, error } => self.error = Some(open_failure_message(&path, &error)),
+            Event::OpenFailed { path, error } => {
+                self.open_intent = None;
+                self.error = Some(open_failure_message(&path, &error));
+            }
             Event::LogLoaded { repo, scope, history } => {
                 // Only if it is still what the user wants to see: they may have opened another
                 // repository or picked another branch while this one loaded.
@@ -890,6 +923,14 @@ impl GitCraftApp {
         // Changes and History are picked inside the Repository tab (drawn below); Changes being
         // shown again is noticed at the end of the frame.
         let changes_before = self.showing_changes();
+        // While a submodule is open: the "parent / submodule" trail above the toolbar.
+        if let (MainTab::Repository, Some(open), false) = (self.tab, &self.open, self.breadcrumb.is_empty()) {
+            let current = open.repo.root().to_path_buf();
+            let clicked = egui::Panel::top("breadcrumb").show(ui, |ui| submodules::breadcrumb(ui, &self.breadcrumb, &current)).inner;
+            if let Some(index) = clicked {
+                self.open_parent(index);
+            }
+        }
         if let (MainTab::Repository, Some(open)) = (self.tab, &self.open) {
             let view = repository::ToolbarView {
                 root: open.repo.root(),
@@ -962,6 +1003,7 @@ impl GitCraftApp {
                 self.confirm = Some(Pending::DiscardLines { path, patch, question });
             }
             Some(Picked::Commit(commit_tab::Action::Problem(message))) => self.error = Some(message),
+            Some(Picked::Commit(commit_tab::Action::OpenSubmodule(path))) => self.open_submodule(&path),
             Some(Picked::Repository(repository::Pick::Commit(id))) => {
                 // A parent link: select it, and bring it into view if it is in the list.
                 self.select_commit(id);
@@ -977,12 +1019,91 @@ impl GitCraftApp {
         about::show(ui.ctx(), &mut self.about_open);
         self.show_confirmation(ui.ctx());
         self.show_branch_dialog(ui.ctx());
+        self.show_submodules_window(ui.ctx());
         self.remember_layout();
     }
 
     /// The Changes view is on screen.
     fn showing_changes(&self) -> bool {
         self.tab == MainTab::Repository && self.layout.view == RepoView::Changes
+    }
+
+    /// Opens the Submodules window and reads the list.
+    fn show_submodules(&mut self) {
+        if self.open.is_none() {
+            self.error = Some("Open a repository first.".into());
+            return;
+        }
+        self.submodules_window = Some(SubmodulesWindow::default());
+        self.load_submodules();
+    }
+
+    /// Reads the submodule list again (shown with a spinner meanwhile).
+    fn load_submodules(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        let job = Job::LoadSubmodules { repo: open.repo.clone() };
+        if let Some(window) = self.submodules_window.as_mut() {
+            window.list = None;
+        }
+        self.send(job);
+    }
+
+    /// Shows the Submodules window, if open, and acts on what was picked.
+    fn show_submodules_window(&mut self, ctx: &egui::Context) {
+        let Some(window) = &self.submodules_window else {
+            return;
+        };
+        if let Some(pick) = submodules::window(ctx, window) {
+            self.handle_submodule_pick(pick);
+        }
+    }
+
+    /// Acts on something picked in the Submodules window.
+    fn handle_submodule_pick(&mut self, pick: SubmodulePick) {
+        match pick {
+            SubmodulePick::Open(path) => {
+                self.submodules_window = None;
+                self.open_submodule(&path);
+            }
+            SubmodulePick::Init(path) => self.run_net(NetOp::SubmoduleInit { path }),
+            SubmodulePick::Update(path) => {
+                let question = Confirm {
+                    title: "Update submodule?".into(),
+                    body: format!(
+                        "\"{path}\" will check out the commit this repository records for it. Commits made in the submodule stay on 
+                         their branch, but it is left on the recorded commit (not on a branch). If uncommitted changes inside it would 
+                         be overwritten, git refuses and nothing changes."
+                    ),
+                    action: "Update submodule".into(),
+                };
+                self.confirm = Some(Pending::UpdateSubmodule { path, question });
+            }
+            SubmodulePick::Close => self.submodules_window = None,
+        }
+    }
+
+    /// Opens the submodule at `path` (relative to the open repository), keeping the trail back.
+    fn open_submodule(&mut self, path: &str) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        let root = open.repo.root().to_path_buf();
+        let mut trail = self.breadcrumb.clone();
+        trail.push(root.clone());
+        self.open_intent = Some(trail);
+        self.tab = MainTab::Repository;
+        self.open_folder(root.join(path));
+    }
+
+    /// Goes back to the repository at `index` in the trail.
+    fn open_parent(&mut self, index: usize) {
+        let Some(target) = self.breadcrumb.get(index).cloned() else {
+            return;
+        };
+        self.open_intent = Some(self.breadcrumb.get(..index).unwrap_or_default().to_vec());
+        self.open_folder(target);
     }
 
     /// Acts on something picked in the Current branch dropdown (or the Branch menu).
@@ -1129,7 +1250,8 @@ impl GitCraftApp {
                 | Pending::Discard { question, .. }
                 | Pending::DiscardLines { question, .. }
                 | Pending::DeleteBranch { question, .. }
-                | Pending::ForcePush(question),
+                | Pending::ForcePush(question)
+                | Pending::UpdateSubmodule { question, .. },
             ) => question,
             None => return,
         };
@@ -1153,6 +1275,7 @@ impl GitCraftApp {
             }
             Some(Pending::DeleteBranch { name, .. }) => self.change_branch(BranchOp::Delete { name }),
             Some(Pending::ForcePush(_)) => self.run_net(NetOp::ForcePush),
+            Some(Pending::UpdateSubmodule { path, .. }) => self.run_net(NetOp::SubmoduleUpdate { path }),
             Some(Pending::DiscardLines { path, patch, .. }) => {
                 if let Some(open) = &self.open {
                     let job = Job::DiscardLines { repo: open.repo.clone(), path, patch };
@@ -1436,6 +1559,8 @@ fn net_name(op: &NetOp) -> &'static str {
         NetOp::Push => "Push",
         NetOp::ForcePush => "Force push",
         NetOp::Publish { .. } => "Publish",
+        NetOp::SubmoduleInit { .. } => "Submodule initialise",
+        NetOp::SubmoduleUpdate { .. } => "Submodule update",
     }
 }
 
@@ -2038,6 +2163,89 @@ mod tests {
         assert!(changed_paths(&app).is_empty(), "the committed file left the Changes list");
         assert_eq!(app.open.as_ref().unwrap().selected, selected, "the selection stays");
         assert!(matches!(app.status_line(), StatusLine::Info(_)), "no error");
+    }
+
+    /// A parent repository with `lib` (two commits) added as the submodule "lib", recorded at the
+    /// second. The returned `TestRepo`s keep both folders alive.
+    fn repo_with_submodule() -> (TestRepo, TestRepo) {
+        let lib = TestRepo::with_commits(&[]);
+        lib.commit_files(&[("lib.txt", "1\n")], "Lib 1");
+        lib.commit_files(&[("lib.txt", "2\n")], "Lib 2");
+        let parent = TestRepo::with_commits(&["Root"]);
+        // Local-folder submodules are blocked by default; allowed here for the test only.
+        parent.git(&["-c", "protocol.file.allow=always", "submodule", "add", "-q", lib.path().to_str().unwrap(), "lib"]);
+        parent.git(&["commit", "-q", "-m", "Add lib"]);
+        (parent, lib)
+    }
+
+    /// Runs git inside the parent's submodule folder.
+    fn git_in(folder: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git").args(args).current_dir(folder).output().unwrap().status;
+        assert!(status.success(), "{args:?}");
+    }
+
+    fn submodule_list(app: &GitCraftApp) -> Vec<gitcraft_git::Submodule> {
+        match app.submodules_window.as_ref().and_then(|window| window.list.clone()) {
+            Some(Ok(list)) => list,
+            other => panic!("no list: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_submodules_window_lists_and_updates_them() {
+        let (parent, _lib) = repo_with_submodule();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, parent.path().to_path_buf());
+        app.run(Command::Submodules);
+        settle(&mut app, &ctx);
+        let list = submodule_list(&app);
+        assert_eq!(list.len(), 1);
+        assert_eq!(submodules::state_text(&list[0]), "Up to date");
+
+        // Checked out at the older commit: out of date, and the Changes view shows it as a submodule.
+        git_in(&parent.path().join("lib"), &["checkout", "-q", "HEAD~1"]);
+        app.load_submodules();
+        app.refresh_status();
+        settle(&mut app, &ctx);
+        assert!(submodule_list(&app)[0].out_of_date());
+        assert_eq!(changed_paths(&app), ["lib"]);
+        let DiffState::Loaded(view) = &changes(&mut app).diff else { panic!("the submodule's change is loaded") };
+        let change = submodules::submodule_change(&view.diff);
+        assert!(change.recorded.is_some() && change.checked_out.is_some() && change.recorded != change.checked_out, "{change:?}");
+
+        // Update asks first, then checks the recorded commit out again.
+        app.handle_submodule_pick(SubmodulePick::Update("lib".into()));
+        assert!(matches!(&app.confirm, Some(Pending::UpdateSubmodule { question, .. }) if question.body.contains("\"lib\"")));
+        app.run_pending();
+        settle(&mut app, &ctx);
+        assert!(!submodule_list(&app)[0].out_of_date(), "back at the recorded commit");
+        assert!(changed_paths(&app).is_empty());
+    }
+
+    #[test]
+    fn opening_a_submodule_shows_the_trail_back_and_keeps_the_recent_list() {
+        let (parent, _lib) = repo_with_submodule();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, parent.path().to_path_buf());
+        let parent_root = open_root(&app).unwrap();
+        let recent_before = app.settings.get().repositories.paths();
+
+        app.run(Command::Submodules);
+        settle(&mut app, &ctx);
+        app.handle_submodule_pick(SubmodulePick::Open("lib".into()));
+        settle(&mut app, &ctx);
+        assert!(app.submodules_window.is_none(), "the window closes");
+        assert!(open_root(&app).unwrap().ends_with("lib"), "{:?}", open_root(&app));
+        assert_eq!(app.breadcrumb, std::slice::from_ref(&parent_root));
+        assert_eq!(summaries(&app), ["Lib 2", "Lib 1"], "the submodule's own history");
+        assert_eq!(app.settings.get().repositories.paths(), recent_before, "submodules stay out of the recent list");
+
+        app.open_parent(0);
+        settle(&mut app, &ctx);
+        assert_eq!(open_root(&app), Some(parent_root));
+        assert!(app.breadcrumb.is_empty(), "back at the top: no trail");
     }
 
     #[test]

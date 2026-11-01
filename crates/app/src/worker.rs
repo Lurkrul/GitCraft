@@ -12,8 +12,8 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
 use gitcraft_git::{
-    AmendInfo, CancelFlag, CommitDetails, DEFAULT_LOG_LIMIT, DiffRequest, FileDiff, Git, GitError, LogScope, PushMode, Refs, Repo, Status, SyncState,
-    WorkingDiffRequest,
+    AmendInfo, CancelFlag, CommitDetails, DEFAULT_LOG_LIMIT, DiffRequest, FileDiff, Git, GitError, LogScope, PushMode, Refs, Repo, Status, Submodule,
+    SyncState, WorkingDiffRequest,
 };
 
 use crate::files;
@@ -48,6 +48,8 @@ pub enum Job {
     CountOnlyOn { repo: Repo, name: String },
     /// Read the remotes, upstream and ahead/behind counts for the sync button.
     LoadSync { repo: Repo },
+    /// List the submodules with their state.
+    LoadSubmodules { repo: Repo },
     /// Fetch, pull or push (sent to the network worker, so local work isn't held up). Setting
     /// `cancel` stops it.
     Net { repo: Repo, op: NetOp, cancel: CancelFlag },
@@ -145,6 +147,10 @@ pub enum Event {
     SyncLoaded {
         repo: Repo,
         result: Result<SyncState, GitError>,
+    },
+    SubmodulesLoaded {
+        repo: Repo,
+        result: Result<Vec<Submodule>, GitError>,
     },
     NetDone {
         repo: Repo,
@@ -348,6 +354,10 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, wake: Wake) {
                 });
                 Event::BranchChanged { repo, op, result }
             }
+            Job::LoadSubmodules { repo } => {
+                let result = located(&mut git).and_then(|git| git.submodules(&repo));
+                Event::SubmodulesLoaded { repo, result }
+            }
             Job::LoadSync { repo } => {
                 let result = located(&mut git).and_then(|git| git.sync_state(&repo));
                 Event::SyncLoaded { repo, result }
@@ -359,6 +369,8 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, wake: Wake) {
                     NetOp::Push => git.push(&repo, PushMode::Normal, Some(cancel)),
                     NetOp::ForcePush => git.push(&repo, PushMode::ForceWithLease, Some(cancel)),
                     NetOp::Publish { remote, branch } => git.publish(&repo, remote, branch, Some(cancel)),
+                    NetOp::SubmoduleInit { path } => git.init_submodule(&repo, path, Some(cancel)),
+                    NetOp::SubmoduleUpdate { path } => git.update_submodule(&repo, path, Some(cancel)),
                 });
                 Event::NetDone { repo, op, result }
             }

@@ -19,12 +19,14 @@ pub enum Command {
     Push,
     /// Push with `--force-with-lease` (asks first).
     ForcePush,
+    /// Show the submodules window.
+    Submodules,
     About,
 }
 
 impl Command {
     /// Every command, for building the menu and checking shortcuts.
-    pub const ALL: [Command; 9] = [
+    pub const ALL: [Command; 10] = [
         Command::OpenRepository,
         Command::ClearRecent,
         Command::NewBranch,
@@ -33,6 +35,7 @@ impl Command {
         Command::Pull,
         Command::Push,
         Command::ForcePush,
+        Command::Submodules,
         Command::About,
     ];
 
@@ -47,6 +50,7 @@ impl Command {
             Command::Pull => "repository.pull",
             Command::Push => "repository.push",
             Command::ForcePush => "repository.force_push",
+            Command::Submodules => "repository.submodules",
             Command::About => "help.about",
         }
     }
@@ -61,6 +65,7 @@ impl Command {
             Command::Pull => "Pull",
             Command::Push => "Push",
             Command::ForcePush => "Force Push…",
+            Command::Submodules => "Submodules…",
             Command::About => "About GitCraft",
         }
     }
@@ -74,7 +79,7 @@ impl Command {
             Command::Fetch => "Cmd+Shift+T",
             Command::Pull => "Cmd+Shift+P",
             Command::Push => "Cmd+P",
-            Command::ClearRecent | Command::RenameBranch | Command::ForcePush | Command::About => return None,
+            Command::ClearRecent | Command::RenameBranch | Command::ForcePush | Command::Submodules | Command::About => return None,
         };
         // The text is fixed above, so parsing can't fail in practice; `ok()` keeps it panic-free.
         Chord::parse(text).ok()

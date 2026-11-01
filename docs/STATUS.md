@@ -173,7 +173,8 @@ exactly like the command line. Submodules as designed (G7).
 | G4 | Discard single hunks, blocks and lines (whole files are done in G2b) | done (`cd2241f`) |
 | G5 | Branches: new, checkout, rename, delete (with confirmations) | done (`f302b1c`) |
 | G6 | Repository menu: fetch, pull, push on a second worker; cancel; `--force-with-lease` only | done |
-| G7 | Submodules: Repository → Submodules menu, list, open with breadcrumb, Commit tab entries | next |
+| G7 | Submodules: Repository → Submodules menu, list, open with breadcrumb, Commit tab entries | done |
+| G7b | Add submodule (URL and folder; `git submodule add` on the network worker) | next |
 
 G1 details:
 - Git layer: `status(repo)` runs `git status --porcelain=v2 -z --untracked-files=all --no-renames
@@ -385,6 +386,25 @@ showed after a restart): every 5 seconds while a repository is open, and when th
 focus back or F5 is pressed, a quiet `CheckRefs` job reads the refs; only if they differ from what is on
 screen does it read the history too, and then the changed files and push/pull counts are read again.
 The selection stays. Background errors are reported once, not every 5 seconds.
+
+G7 details:
+- Git layer (`submodule.rs`): `submodules` (gitlinks from `ls-files --stage -z`; for each, whether it is
+  initialised, its checked-out commit and whether it has local changes), `init_submodule` (`submodule
+  update --init`, clones) and `update_submodule` (`submodule update`), both cancellable with a 30-minute
+  limit. `Git::with_config` adds `-c` settings for tests only (local-folder submodules are blocked by
+  default for safety; GitCraft never lowers that).
+- Repository → Submodules… opens a window: each submodule's path and state (up to date / out of date
+  with both commits / uncommitted changes / not initialised), with Open, Initialise and Update…
+  (asks first). Initialise and Update run on the network worker (Push/Pull box shows them, cancel
+  works).
+- Opening a submodule shows a "parent / submodule" trail above the toolbar; clicking a parent goes
+  back. Submodules (and parents reached from them) stay out of the recent list.
+- Changes view: a changed submodule shows a summary instead of a diff (recorded commit, checked-out
+  commit, uncommitted changes inside) with "Open submodule"; ticking it commits the new recorded
+  commit. Its Discard menu item points to Update in the Submodules window.
+
+Milestone 3 (Git actions) is complete. Next: Milestone 4, GitHub sign-in (device flow, token in the
+OS credential store, sign out).
 
 ## Feature checklist
 

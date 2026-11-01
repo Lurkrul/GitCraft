@@ -18,6 +18,14 @@ pub enum NetOp {
     },
     /// `--force-with-lease` (asked first).
     ForcePush,
+    /// Clone a submodule and check out its recorded commit.
+    SubmoduleInit {
+        path: String,
+    },
+    /// Check out a submodule's recorded commit (asked first).
+    SubmoduleUpdate {
+        path: String,
+    },
 }
 
 impl NetOp {
@@ -28,6 +36,8 @@ impl NetOp {
             NetOp::Pull => "Pulling…",
             NetOp::Push | NetOp::ForcePush => "Pushing…",
             NetOp::Publish { .. } => "Publishing…",
+            NetOp::SubmoduleInit { .. } => "Initialising submodule…",
+            NetOp::SubmoduleUpdate { .. } => "Updating submodule…",
         }
     }
 
@@ -39,6 +49,8 @@ impl NetOp {
             NetOp::Push => "Could not push",
             NetOp::ForcePush => "Could not force push",
             NetOp::Publish { .. } => "Could not publish the branch",
+            NetOp::SubmoduleInit { .. } => "Could not initialise the submodule",
+            NetOp::SubmoduleUpdate { .. } => "Could not update the submodule",
         }
     }
 }

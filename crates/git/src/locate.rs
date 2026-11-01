@@ -15,6 +15,8 @@ use crate::platform;
 pub struct Git {
     exe: PathBuf,
     version: String,
+    /// Extra `-c key=value` settings for every command (see [`Git::with_config`]).
+    extra_config: Vec<String>,
 }
 
 impl Git {
@@ -37,12 +39,25 @@ impl Git {
         }
         let text = String::from_utf8_lossy(&output.stdout);
         let version = text.trim().strip_prefix("git version ").ok_or_else(|| unusable(format!("unexpected version output {:?}", text.trim())))?;
-        Ok(Git { exe, version: version.to_string() })
+        Ok(Git { exe, version: version.to_string(), extra_config: Vec::new() })
     }
 
     /// The executable in use.
     pub fn exe(&self) -> &Path {
         &self.exe
+    }
+
+    /// Adds a `key=value` setting passed as `-c` to every command (and, through git, to the commands
+    /// it starts, such as the clone of a submodule). GitCraft itself never uses this: it exists for
+    /// tests that need a setting the user's config can't be relied on for (local-folder submodules
+    /// are blocked by default for safety, and tests clone from local folders).
+    pub fn with_config(mut self, setting: &str) -> Git {
+        self.extra_config.push(setting.to_string());
+        self
+    }
+
+    pub(crate) fn extra_config(&self) -> &[String] {
+        &self.extra_config
     }
 
     /// Git's version string, such as `2.54.0.windows.1`.

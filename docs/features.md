@@ -132,6 +132,20 @@ your own.
 - [ ] Cancel stops it ("Push cancelled.").
 - [ ] Pushing over HTTPS with Git Credential Manager shows its sign-in window when needed.
 
+## Submodules
+
+- [ ] Repository → Submodules… lists the submodules with their state: up to date, out of date (both
+      commits shown), with uncommitted changes, or not initialised.
+- [ ] Initialise clones a submodule that isn't cloned yet (the Push/Pull box shows it running; Cancel
+      works).
+- [ ] Update… asks first, then checks out the recorded commit; it is refused (nothing changes) if
+      uncommitted changes inside the submodule would be overwritten.
+- [ ] Open shows the submodule like any repository, with a "parent / submodule" trail above the
+      toolbar; clicking the parent goes back. The submodule doesn't appear in the recent list.
+- [ ] In the Changes view, a changed submodule shows a summary (recorded commit, checked-out commit,
+      uncommitted changes) with "Open submodule" instead of a diff; ticking it and committing records
+      the new commit.
+
 ## Changes view: changes
 
 - [ ] The changed files list a checkbox, the path from the repository root, and the change letter on

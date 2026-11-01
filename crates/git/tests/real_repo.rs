@@ -195,6 +195,73 @@ fn a_repository_without_remotes_has_nothing_to_sync() {
     assert_eq!(git.sync_state(&opened).unwrap().branch, None, "detached");
 }
 
+/// A parent repository with the repository `lib` (two commits, recorded at the second) added as
+/// the submodule `lib`.
+fn with_submodule() -> (TestRepo, TestRepo) {
+    let lib = TestRepo::new();
+    write(&lib, "lib.txt", "1\n");
+    lib.git(&["add", "."]);
+    lib.commit("Lib 1");
+    write(&lib, "lib.txt", "2\n");
+    lib.git(&["commit", "-q", "-am", "Lib 2"]);
+    let parent = TestRepo::new();
+    parent.commit("Root");
+    // Local-folder submodules are blocked by default; allowed here for the test only.
+    parent.git(&["-c", "protocol.file.allow=always", "submodule", "add", "-q", lib.path().to_str().unwrap(), "lib"]);
+    parent.git(&["commit", "-q", "-m", "Add lib"]);
+    (parent, lib)
+}
+
+#[test]
+fn submodules_are_listed_with_their_state() {
+    let (parent, lib) = with_submodule();
+    let git = git();
+    let opened = git.open_repo(parent.path()).unwrap();
+    let subs = git.submodules(&opened).unwrap();
+    assert_eq!(subs.len(), 1);
+    let recorded = lib.git(&["rev-parse", "HEAD"]);
+    assert_eq!((subs[0].path.as_str(), subs[0].recorded.as_str()), ("lib", recorded.as_str()));
+    assert!(subs[0].initialized() && !subs[0].out_of_date() && !subs[0].dirty);
+
+    // Checked out at the older commit, with a local change.
+    let inside = parent.path().join("lib");
+    let run_inside = |args: &[&str]| {
+        let status = Command::new("git").args(args).current_dir(&inside).output().unwrap().status;
+        assert!(status.success(), "{args:?}");
+    };
+    run_inside(&["checkout", "-q", "HEAD~1"]);
+    std::fs::write(inside.join("lib.txt"), "edited\n").unwrap();
+    let subs = git.submodules(&opened).unwrap();
+    assert!(subs[0].out_of_date() && subs[0].dirty);
+
+    // Update puts the recorded commit back (refused while the local change would be overwritten).
+    assert!(git.update_submodule(&opened, "lib", None).is_err());
+    run_inside(&["checkout", "-q", "--", "lib.txt"]);
+    git.update_submodule(&opened, "lib", None).unwrap();
+    let subs = git.submodules(&opened).unwrap();
+    assert!(!subs[0].out_of_date() && !subs[0].dirty);
+    assert!(git.update_submodule(&opened, "../escape", None).is_err());
+}
+
+#[test]
+fn a_fresh_clone_initialises_its_submodule() {
+    let (parent, _lib) = with_submodule();
+    let clone_dir = tempfile::tempdir().unwrap();
+    let clone = clone_dir.path().join("clone");
+    parent.git(&["clone", "-q", parent.path().to_str().unwrap(), clone.to_str().unwrap()]);
+    let git = git();
+    let opened = git.open_repo(&clone).unwrap();
+    let subs = git.submodules(&opened).unwrap();
+    assert!(!subs[0].initialized(), "not cloned yet");
+
+    let allowed = git.clone().with_config("protocol.file.allow=always");
+    allowed.init_submodule(&opened, "lib", None).unwrap();
+    let subs = git.submodules(&opened).unwrap();
+    assert!(subs[0].initialized() && !subs[0].out_of_date());
+    // The clone uses the machine's own git config, which may check files out with CRLF.
+    assert_eq!(std::fs::read_to_string(clone.join("lib").join("lib.txt")).unwrap().trim_end(), "2");
+}
+
 /// The branch HEAD is on, short.
 fn current_branch(repo: &TestRepo) -> String {
     repo.git(&["branch", "--show-current"])

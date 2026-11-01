@@ -39,6 +39,8 @@ fn menu_bar(recent: &[RecentItem]) -> MenuBar {
                     item(Command::Push).into(),
                     Node::Separator,
                     item(Command::ForcePush).into(),
+                    Node::Separator,
+                    item(Command::Submodules).into(),
                 ],
             ),
             Menu::new("Branch", vec![item(Command::NewBranch).into(), item(Command::RenameBranch).into()]),

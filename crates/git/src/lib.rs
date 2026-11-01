@@ -30,6 +30,7 @@ mod refs;
 mod remote;
 mod repo;
 mod status;
+mod submodule;
 
 pub use command::{CancelFlag, RunOptions};
 pub use commit::{AmendInfo, CommitRequest, PartialFile};
@@ -42,3 +43,4 @@ pub use refs::{Head, Ref, RefKind, Refs};
 pub use remote::{PushMode, SyncState};
 pub use repo::Repo;
 pub use status::{Change, EntryKind, MAX_STATUS_ENTRIES, Status, StatusEntry, WorkingChange, WorkingDiffRequest};
+pub use submodule::Submodule;

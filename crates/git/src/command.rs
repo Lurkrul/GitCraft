@@ -90,8 +90,11 @@ impl Git {
 
     fn run_inner(&self, cwd: &Path, args: &[&str], options: &RunOptions, input: Option<Vec<u8>>) -> Result<Vec<u8>> {
         let mut command = Command::new(self.exe());
+        command.args(GLOBAL_ARGS);
+        for setting in self.extra_config() {
+            command.arg("-c").arg(setting);
+        }
         command
-            .args(GLOBAL_ARGS)
             .args(args)
             .current_dir(cwd)
             // Never wait for a username or password typed into a terminal nobody can see.

@@ -24,7 +24,8 @@ pub fn file_menu(ui: &mut egui::Ui, entry: &StatusEntry, programs: &[PathBuf]) -
     // A deleted file isn't on disk, so there is nothing to show or open.
     let on_disk = entry.change() != WorkingChange::Deleted;
 
-    if menu_item(ui, !entry.submodule, "Discard changes…", "Submodules come in a later version.") {
+    if menu_item(ui, !entry.submodule, "Discard changes…", "To put a submodule back to its recorded commit, use Update in Repository → Submodules….")
+    {
         chosen = Some(FileCommand::Discard);
     }
     ui.separator();
