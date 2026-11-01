@@ -12,7 +12,8 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
 use gitcraft_git::{
-    AmendInfo, CommitDetails, DEFAULT_LOG_LIMIT, DiffRequest, FileDiff, Git, GitError, LogScope, Refs, Repo, Status, WorkingDiffRequest,
+    AmendInfo, CancelFlag, CommitDetails, DEFAULT_LOG_LIMIT, DiffRequest, FileDiff, Git, GitError, LogScope, PushMode, Refs, Repo, Status, SyncState,
+    WorkingDiffRequest,
 };
 
 use crate::files;
@@ -20,6 +21,7 @@ use crate::graph::History;
 use crate::prestage::{self, Prestage};
 use crate::ui::branches::BranchOp;
 use crate::ui::commit_tab::CommitPlan;
+use crate::ui::sync::NetOp;
 
 /// Called by the worker after each event, to make the UI repaint (and so poll) right away.
 /// `Arc<dyn Fn ...>` is a shared, thread-safe function object, like `std::shared_ptr<std::function<void()>>`.
@@ -40,6 +42,13 @@ pub enum Job {
     Branch { repo: Repo, op: BranchOp },
     /// Count the commits only this branch reaches (lost if it is deleted), for the warning.
     CountOnlyOn { repo: Repo, name: String },
+    /// Read the remotes, upstream and ahead/behind counts for the sync button.
+    LoadSync { repo: Repo },
+    /// Fetch, pull or push (sent to the network worker, so local work isn't held up). Setting
+    /// `cancel` stops it.
+    Net { repo: Repo, op: NetOp, cancel: CancelFlag },
+    /// Count the upstream's commits the branch doesn't have, for the force-push warning.
+    CountUpstreamOnly { repo: Repo },
     /// Read one commit in full (message, people, changed files) for the details panel.
     LoadDetails { repo: Repo, id: String },
     /// Read one changed file's diff for the diff view.
@@ -121,6 +130,19 @@ pub enum Event {
     OnlyOnCounted {
         repo: Repo,
         name: String,
+        result: Result<usize, GitError>,
+    },
+    SyncLoaded {
+        repo: Repo,
+        result: Result<SyncState, GitError>,
+    },
+    NetDone {
+        repo: Repo,
+        op: NetOp,
+        result: Result<(), GitError>,
+    },
+    UpstreamOnlyCounted {
+        repo: Repo,
         result: Result<usize, GitError>,
     },
     DetailsLoaded {
@@ -304,6 +326,24 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, wake: Wake) {
                     BranchOp::Delete { name } => git.delete_branch(&repo, name),
                 });
                 Event::BranchChanged { repo, op, result }
+            }
+            Job::LoadSync { repo } => {
+                let result = located(&mut git).and_then(|git| git.sync_state(&repo));
+                Event::SyncLoaded { repo, result }
+            }
+            Job::Net { repo, op, cancel } => {
+                let result = located(&mut git).and_then(|git| match &op {
+                    NetOp::Fetch => git.fetch(&repo, Some(cancel)),
+                    NetOp::Pull => git.pull(&repo, Some(cancel)),
+                    NetOp::Push => git.push(&repo, PushMode::Normal, Some(cancel)),
+                    NetOp::ForcePush => git.push(&repo, PushMode::ForceWithLease, Some(cancel)),
+                    NetOp::Publish { remote, branch } => git.publish(&repo, remote, branch, Some(cancel)),
+                });
+                Event::NetDone { repo, op, result }
+            }
+            Job::CountUpstreamOnly { repo } => {
+                let result = located(&mut git).and_then(|git| git.upstream_only_commits(&repo));
+                Event::UpstreamOnlyCounted { repo, result }
             }
             Job::CountOnlyOn { repo, name } => {
                 let result = located(&mut git).and_then(|git| git.commits_only_on(&repo, &name));

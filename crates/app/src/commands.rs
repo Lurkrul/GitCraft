@@ -13,12 +13,28 @@ pub enum Command {
     NewBranch,
     /// Rename the checked-out branch (asks for the new name).
     RenameBranch,
+    Fetch,
+    Pull,
+    /// Push the checked-out branch (publishing it if it has no upstream yet).
+    Push,
+    /// Push with `--force-with-lease` (asks first).
+    ForcePush,
     About,
 }
 
 impl Command {
     /// Every command, for building the menu and checking shortcuts.
-    pub const ALL: [Command; 5] = [Command::OpenRepository, Command::ClearRecent, Command::NewBranch, Command::RenameBranch, Command::About];
+    pub const ALL: [Command; 9] = [
+        Command::OpenRepository,
+        Command::ClearRecent,
+        Command::NewBranch,
+        Command::RenameBranch,
+        Command::Fetch,
+        Command::Pull,
+        Command::Push,
+        Command::ForcePush,
+        Command::About,
+    ];
 
     /// The stable id craft-menu reports when the item is chosen.
     pub fn id(self) -> &'static str {
@@ -27,6 +43,10 @@ impl Command {
             Command::ClearRecent => "file.clear_recent",
             Command::NewBranch => "branch.new",
             Command::RenameBranch => "branch.rename",
+            Command::Fetch => "repository.fetch",
+            Command::Pull => "repository.pull",
+            Command::Push => "repository.push",
+            Command::ForcePush => "repository.force_push",
             Command::About => "help.about",
         }
     }
@@ -37,6 +57,10 @@ impl Command {
             Command::ClearRecent => "Clear recent list",
             Command::NewBranch => "New Branch…",
             Command::RenameBranch => "Rename Current Branch…",
+            Command::Fetch => "Fetch",
+            Command::Pull => "Pull",
+            Command::Push => "Push",
+            Command::ForcePush => "Force Push…",
             Command::About => "About GitCraft",
         }
     }
@@ -46,7 +70,11 @@ impl Command {
         let text = match self {
             Command::OpenRepository => "Cmd+O",
             Command::NewBranch => "Cmd+Shift+N",
-            Command::ClearRecent | Command::RenameBranch | Command::About => return None,
+            // The same keys as GitHub Desktop.
+            Command::Fetch => "Cmd+Shift+T",
+            Command::Pull => "Cmd+Shift+P",
+            Command::Push => "Cmd+P",
+            Command::ClearRecent | Command::RenameBranch | Command::ForcePush | Command::About => return None,
         };
         // The text is fixed above, so parsing can't fail in practice; `ok()` keeps it panic-free.
         Chord::parse(text).ok()

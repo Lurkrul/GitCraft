@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use gitcraft_git::{LogScope, Ref, Refs};
+use gitcraft_git::{LogScope, Ref, Refs, SyncState};
 
 use crate::commands::Command;
 use crate::graph::History;
@@ -14,6 +14,9 @@ use crate::ui::diff_view::{self, DiffState};
 use crate::ui::recent::{self, RecentItem, RepositoryPick};
 use crate::ui::ref_labels::LabelMap;
 use crate::ui::split::Split;
+use crate::ui::sync::{self, NetOp, SyncPick};
+use crate::ui::tabs::{self, RepoView};
+use crate::ui::toolbar_box;
 use crate::ui::{commit_list, split};
 
 const ALL_BRANCHES: &str = "All branches";
@@ -77,54 +80,76 @@ pub enum ToolbarPick {
     Repository(RepositoryPick),
     /// Something in the Current branch dropdown.
     Branch(BranchPick),
+    /// The sync button (fetch, pull, push, publish, or Cancel).
+    Sync(SyncPick),
 }
 
 /// The toolbar under the tabs: the Current branch dropdown (check out and manage branches), the
 /// history filter ("Show:"), then the repository dropdown (its name, full path on hover; opened,
 /// the recent repositories). Returns what was picked this frame. `show_filter` is false where the
 /// history isn't shown (the Commit tab).
-pub fn toolbar(ui: &mut egui::Ui, root: &Path, refs: &Refs, selected: &LogScope, recent: &[RecentItem], show_filter: bool) -> Option<ToolbarPick> {
-    let mut picked = None;
-    ui.horizontal(|ui| {
-        ui.label("Current branch:");
-        if let Some(pick) = branches::current_branch(ui, refs) {
-            picked = Some(ToolbarPick::Branch(pick));
-        }
-        ui.separator();
-        if !show_filter {
-            ui.label("Repository:");
-            if let Some(pick) = recent::dropdown(ui, root, recent) {
-                picked = Some(ToolbarPick::Repository(pick));
-            }
-            return;
-        }
-        ui.label("Show:").on_hover_text("Which branch's history to show (this doesn't check anything out)");
-        // craft-ui's combo box, not egui's (clippy.toml forbids that one; see craft-libs).
-        craft_ui::ComboBox::from_id_salt("branch").selected_text(scope_label(selected)).width(220.0).height(DROPDOWN_HEIGHT).show_ui(ui, |ui| {
-            for row in branch_rows(refs) {
-                match row {
-                    BranchRow::Heading(text) => {
-                        ui.add_space(4.0);
-                        ui.weak(text);
-                    }
-                    BranchRow::Choice { scope, label } => {
-                        let is_selected = &scope == selected;
-                        if ui.selectable_label(is_selected, label).clicked() && !is_selected {
-                            picked = Some(ToolbarPick::Scope(scope));
-                        }
-                    }
-                }
-            }
-        });
-        ui.separator();
-        ui.label("Repository:");
-        if let Some(pick) = recent::dropdown(ui, root, recent) {
-            picked = Some(ToolbarPick::Repository(pick));
-        }
-    });
-    picked
+/// What the toolbar needs to draw.
+pub struct ToolbarView<'a> {
+    pub root: &'a Path,
+    pub refs: &'a Refs,
+    /// The history filter's choice.
+    pub selected: &'a LogScope,
+    pub recent: &'a [RecentItem],
+    /// False where the history isn't shown (the Commit tab): no filter then.
+    pub show_filter: bool,
+    pub sync: Option<&'a SyncState>,
+    /// The network command running, if any.
+    pub running: Option<&'a NetOp>,
 }
 
+pub fn toolbar(ui: &mut egui::Ui, view: &ToolbarView<'_>) -> Option<ToolbarPick> {
+    let mut picked = None;
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        // Like GitHub Desktop: repository, branch, then the Push/Pull box, side by side.
+        let repository_hover = format!("{}\nClick to switch to another repository.", view.root.display());
+        if let Some(pick) =
+            toolbar_box::dropdown(ui, "Current repository", &repository_name(view.root), &repository_hover, |ui| recent::list(ui, view.recent))
+        {
+            picked = Some(ToolbarPick::Repository(pick));
+        }
+        let branch_hover = "Click to check out another branch, or create one. Right-click a branch in the list for more.";
+        if let Some(pick) =
+            toolbar_box::dropdown(ui, "Current branch", &branches::current_label(view.refs), branch_hover, |ui| branches::list(ui, view.refs))
+        {
+            picked = Some(ToolbarPick::Branch(pick));
+        }
+        if let Some(pick) = sync::sync_box(ui, view.sync, view.running) {
+            picked = Some(ToolbarPick::Sync(pick));
+        }
+        if view.show_filter {
+            ui.add_space(12.0);
+            ui.label("Show:").on_hover_text("Which branch's history to show (this doesn't check anything out)");
+            // craft-ui's combo box, not egui's (clippy.toml forbids that one; see craft-libs).
+            craft_ui::ComboBox::from_id_salt("branch").selected_text(scope_label(view.selected)).width(200.0).height(DROPDOWN_HEIGHT).show_ui(
+                ui,
+                |ui| {
+                    for row in branch_rows(view.refs) {
+                        match row {
+                            BranchRow::Heading(text) => {
+                                ui.add_space(4.0);
+                                ui.weak(text);
+                            }
+                            BranchRow::Choice { scope, label } => {
+                                let is_selected = &scope == view.selected;
+                                if ui.selectable_label(is_selected, label).clicked() && !is_selected {
+                                    picked = Some(ToolbarPick::Scope(scope));
+                                }
+                            }
+                        }
+                    }
+                },
+            );
+        }
+    });
+    ui.add_space(4.0);
+    picked
+}
 /// What the history area needs to draw.
 pub struct BodyView<'a> {
     pub history: &'a History,
@@ -142,23 +167,23 @@ pub struct BodyView<'a> {
 /// The user's layout choices for the Repository tab.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepoLayout {
-    /// The history's share of the width.
-    pub history_ratio: f32,
+    /// The left pane's share of the width, the same in the Changes and History views.
+    pub side_ratio: f32,
     /// The details' share of the right pane's height (the diff gets the rest).
     pub details_ratio: f32,
     /// Whether the details panel's "More info" is open.
     pub details_expanded: bool,
-    /// The Commit tab's changed-files list's share of the width.
-    pub changes_ratio: f32,
+    /// Changes or History.
+    pub view: RepoView,
 }
 
 impl Default for RepoLayout {
     fn default() -> Self {
         RepoLayout {
-            history_ratio: split::DEFAULT_HISTORY_RATIO,
+            side_ratio: split::DEFAULT_SIDE_RATIO,
             details_ratio: split::DEFAULT_DETAILS_RATIO,
             details_expanded: false,
-            changes_ratio: split::DEFAULT_CHANGES_RATIO,
+            view: RepoView::default(),
         }
     }
 }
@@ -178,6 +203,7 @@ pub enum Pick {
 /// commit's details above the selected file's diff. Both dividers can be dragged.
 pub fn body(ui: &mut egui::Ui, view: &BodyView<'_>, layout: &mut RepoLayout) -> Option<Pick> {
     if view.history.log.commits.is_empty() {
+        tabs::view_tabs(ui, &mut layout.view);
         ui.centered_and_justified(|ui| {
             ui.label("This repository has no commits yet.");
         });
@@ -196,12 +222,15 @@ pub fn body(ui: &mut egui::Ui, view: &BodyView<'_>, layout: &mut RepoLayout) -> 
     // of them to borrow a given variable mutably.
     let (mut row, mut action) = (None, None);
     // `RepoLayout`'s fields are borrowed separately, so each closure can change its own.
-    let RepoLayout { history_ratio, details_ratio, details_expanded, .. } = layout;
+    let RepoLayout { side_ratio, details_ratio, details_expanded, view: repo_view } = layout;
     split::two_panes(
         ui,
         &history_split,
-        history_ratio,
-        |ui| row = commit_list::show(ui, view.history, view.labels, view.selected, view.scroll_to),
+        side_ratio,
+        |ui| {
+            tabs::view_tabs(ui, repo_view);
+            row = commit_list::show(ui, view.history, view.labels, view.selected, view.scroll_to);
+        },
         |ui| {
             split::two_panes(
                 ui,

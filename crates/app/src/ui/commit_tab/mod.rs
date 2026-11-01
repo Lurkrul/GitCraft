@@ -22,6 +22,7 @@ use crate::ui::confirm::Confirm;
 use crate::ui::diff_view::{self, DiffAction, DiffState, DiffView, TickClick, TickTarget, Ticks};
 use crate::ui::file_row;
 use crate::ui::split::{self, Split};
+use crate::ui::tabs::{self, RepoView};
 pub use ticks::Partial;
 
 /// Whether a file goes into the next commit.
@@ -482,10 +483,12 @@ pub fn commit_label(status: &Status, amend: bool) -> String {
     }
 }
 
-/// Draws the tab. `ratio` is the left pane's share of the width; `programs` are the ones remembered
-/// for "Open with".
-pub fn show(ui: &mut egui::Ui, changes: &mut Changes, ratio: &mut f32, programs: &[PathBuf]) -> Option<Action> {
+/// Draws the Changes view. `ratio` is the left pane's share of the width (shared with the History
+/// view); `view` is the Changes / History choice, whose tabs head the left pane; `programs` are the ones
+/// remembered for "Open with".
+pub fn show(ui: &mut egui::Ui, changes: &mut Changes, ratio: &mut f32, view: &mut RepoView, programs: &[PathBuf]) -> Option<Action> {
     if changes.status.is_none() {
+        tabs::view_tabs(ui, view);
         ui.centered_and_justified(|ui| match &changes.error {
             Some(error) => {
                 ui.colored_label(ui.visuals().error_fg_color, error);
@@ -521,7 +524,10 @@ pub fn show(ui: &mut egui::Ui, changes: &mut Changes, ratio: &mut f32, programs:
         ui,
         &split,
         ratio,
-        |ui| action = left_pane(ui, changes, programs),
+        |ui| {
+            tabs::view_tabs(ui, view);
+            action = left_pane(ui, changes, programs);
+        },
         |ui| {
             if is_clean {
                 ui.vertical_centered(|ui| {

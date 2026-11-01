@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use gitcraft_git::{
-    CommitRequest, DiffRequest, EntryKind, FileStatus, Git, GitError, Head, LineKind, LogScope, PartialFile, RefKind, WorkingChange,
+    CommitRequest, DiffRequest, EntryKind, FileStatus, Git, GitError, Head, LineKind, LogScope, PartialFile, PushMode, RefKind, WorkingChange,
     WorkingDiffRequest,
 };
 
@@ -79,6 +79,120 @@ fn git() -> Git {
 /// symlinks on Linux or short 8.3 names on Windows).
 fn same_path(a: &Path, b: &Path) -> bool {
     std::fs::canonicalize(a).unwrap() == std::fs::canonicalize(b).unwrap()
+}
+
+/// A repository with one commit, pushed to a bare "origin" in a temporary folder (kept alive by the
+/// returned `TempDir`).
+fn with_origin() -> (TestRepo, tempfile::TempDir, PathBuf) {
+    let work = TestRepo::new();
+    write(&work, "f.txt", "root\n");
+    work.git(&["add", "."]);
+    work.commit("Root");
+    let origin_dir = tempfile::tempdir().unwrap();
+    let origin = origin_dir.path().join("origin.git");
+    work.git(&["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
+    work.git(&["remote", "add", "origin", origin.to_str().unwrap()]);
+    work.git(&["push", "-q", "-u", "origin", "main"]);
+    (work, origin_dir, origin)
+}
+
+/// Someone else's clone of `origin`, on main.
+fn other_clone(origin: &Path) -> TestRepo {
+    let other = TestRepo::new();
+    other.git(&["remote", "add", "origin", origin.to_str().unwrap()]);
+    other.git(&["fetch", "-q", "origin"]);
+    other.git(&["checkout", "-q", "-B", "main", "origin/main"]);
+    other
+}
+
+#[test]
+fn sync_state_counts_ahead_and_behind() {
+    let (work, _keep, origin) = with_origin();
+    let git = git();
+    let opened = git.open_repo(work.path()).unwrap();
+    let state = git.sync_state(&opened).unwrap();
+    assert_eq!(state.remotes, ["origin"]);
+    assert_eq!(state.branch.as_deref(), Some("main"));
+    assert_eq!(state.upstream.as_deref(), Some("origin/main"));
+    assert_eq!((state.ahead, state.behind), (0, 0));
+
+    work.commit("Mine");
+    let other = other_clone(&origin);
+    other.commit("Theirs 1");
+    other.commit("Theirs 2");
+    other.git(&["push", "-q", "origin", "main"]);
+    assert_eq!(git.sync_state(&opened).unwrap().behind, 0, "nothing is known before a fetch");
+    git.fetch(&opened, None).unwrap();
+    let state = git.sync_state(&opened).unwrap();
+    assert_eq!((state.ahead, state.behind), (1, 2));
+    assert_eq!(git.upstream_only_commits(&opened).unwrap(), 2);
+}
+
+#[test]
+fn pull_brings_in_the_remote_commits() {
+    let (work, _keep, origin) = with_origin();
+    let other = other_clone(&origin);
+    write(&other, "g.txt", "theirs\n");
+    other.git(&["add", "."]);
+    other.commit("Theirs");
+    other.git(&["push", "-q", "origin", "main"]);
+
+    let git = git();
+    let opened = git.open_repo(work.path()).unwrap();
+    git.pull(&opened, None).unwrap();
+    assert_eq!(std::fs::read_to_string(work.path().join("g.txt")).unwrap(), "theirs\n");
+    assert_eq!(git.sync_state(&opened).unwrap().behind, 0);
+}
+
+#[test]
+fn push_publish_and_force_with_lease() {
+    let (work, _keep, origin) = with_origin();
+    let git = git();
+    let opened = git.open_repo(work.path()).unwrap();
+    work.commit("Mine");
+    git.push(&opened, PushMode::Normal, None).unwrap();
+    assert_eq!(git.sync_state(&opened).unwrap().ahead, 0);
+
+    // A new branch has no upstream: publishing sets one.
+    work.git(&["checkout", "-q", "-b", "feature"]);
+    work.commit("Feature");
+    assert_eq!(git.sync_state(&opened).unwrap().upstream, None);
+    git.publish(&opened, "origin", "feature", None).unwrap();
+    assert_eq!(git.sync_state(&opened).unwrap().upstream.as_deref(), Some("origin/feature"));
+
+    // Someone else pushes to main; our push is refused, saying to pull.
+    work.git(&["checkout", "-q", "main"]);
+    let other = other_clone(&origin);
+    other.commit("Theirs");
+    other.git(&["push", "-q", "origin", "main"]);
+    work.commit("Mine again");
+    match git.push(&opened, PushMode::Normal, None) {
+        Err(GitError::PushRejected { stale: false, .. }) => {}
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    // A force push with lease is refused while we haven't seen their commit...
+    match git.push(&opened, PushMode::ForceWithLease, None) {
+        Err(GitError::PushRejected { stale: true, .. }) => {}
+        other => panic!("expected a stale-lease refusal, got {other:?}"),
+    }
+    // ...and goes through once we have (after a fetch), replacing it.
+    git.fetch(&opened, None).unwrap();
+    git.push(&opened, PushMode::ForceWithLease, None).unwrap();
+    let remote_head = work.git(&["rev-parse", "origin/main"]);
+    assert_eq!(remote_head, work.git(&["rev-parse", "HEAD"]));
+}
+
+#[test]
+fn a_repository_without_remotes_has_nothing_to_sync() {
+    let repo = TestRepo::new();
+    repo.commit("Root");
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    let state = git.sync_state(&opened).unwrap();
+    assert!(state.remotes.is_empty() && state.upstream.is_none());
+    assert_eq!(state.branch.as_deref(), Some("main"));
+    repo.git(&["checkout", "-q", "--detach"]);
+    assert_eq!(git.sync_state(&opened).unwrap().branch, None, "detached");
 }
 
 /// The branch HEAD is on, short.

@@ -24,9 +24,23 @@ your own.
 
 - [ ] File → Open Repository… (and Ctrl+O) opens the folder picker.
 - [ ] Help → About GitCraft opens the About window, and Close dismisses it.
-- [ ] Tabs: Commit, Repository, Issues, Projects. The app starts on Repository. Issues and Projects
-      are placeholders.
+- [ ] Main tabs: Repository, Issues, Projects. Issues and Projects are placeholders.
 - [ ] Shortcuts do nothing while a menu, dialog or the About window is open.
+
+## Layout (Repository tab)
+
+- [ ] Toolbar, like GitHub Desktop: three big boxes side by side, each with a label on top and the value
+      larger below (both easy to read against the box): "Current repository", "Current branch" (both with a ▾ arrow), then
+      the Push/Pull box ("Push" / "Push 2 commits", "Pull" / "Pull 3 commits", "Fetch origin" /
+      "Up to date", "Publish branch" / "Not on origin yet").
+- [ ] Clicking the repository or branch box opens its list below it; picking an item closes it; a
+      click outside closes it. Long names are cut with "…" and the boxes keep their size.
+- [ ] The left pane has two tabs at its top: Changes and History. Changes shows the changed files,
+      the commit box and the diff; History shows the commit list, details and diffs.
+- [ ] Changes and History share the left pane's width: drag the divider in one, switch, and the
+      other has the same width (also after a restart).
+- [ ] GitCraft opens on Changes the first time, then on whichever view you left it in.
+- [ ] The history filter ("Show:") appears next to the boxes only in the History view.
 
 ## Opening a repository
 
@@ -41,7 +55,7 @@ your own.
       welcome page shows.
 - [ ] File → Open Recent lists repositories opened before, newest first, with the open one checked.
       Picking another opens it on its saved branch.
-- [ ] The toolbar's repository name is a dropdown with the same list (full path on hover), and
+- [ ] The "Current repository" box lists the same repositories (full path on hover), and
       "Open other repository…" opens the folder picker.
 - [ ] A recent repository whose folder was deleted or renamed shows greyed out ("not found" in the
       menu) after switching back to GitCraft.
@@ -49,11 +63,10 @@ your own.
 - [ ] With nothing remembered, Open Recent shows a greyed-out "No recent repositories".
 - [ ] A saved branch that has since been deleted is forgotten, and you get "All branches".
 
-## Repository tab: history and graph
+## History view: history and graph
 
-- [ ] Branch dropdown at the far left: All branches, then Local (current branch marked), then Remote.
+- [ ] "Show:" filter: All branches, then Local (current branch marked), then Remote.
 - [ ] Choosing a branch shows only its history. "All branches" shows everything.
-- [ ] The repository name follows the dropdown. Hovering it shows the full path.
 - [ ] The graph draws lanes, with curved lines for merges and forks, a dot per commit and a smaller dot
       for merges.
 - [ ] Ref labels: the checked-out branch first (bold), local branches filled, remote branches outlined,
@@ -62,7 +75,7 @@ your own.
 - [ ] Click a row to select it. Up/Down move the selection and keep it in view.
 - [ ] Switching branch keeps the selection if that commit is still shown.
 
-## Repository tab: details and diffs
+## History view: details and diffs
 
 - [ ] The divider between the history and the details can be dragged (or focused and moved with the
       arrow keys).
@@ -81,9 +94,9 @@ your own.
 
 ## Branches
 
-- [ ] The toolbar shows "Current branch:" with the checked-out branch, on both the Repository and
-      Commit tabs. The history filter next to it is labelled "Show:" (Repository tab only).
-- [ ] Clicking another branch in the Current branch list checks it out; uncommitted changes that
+- [ ] The "Current branch" box shows the checked-out branch; its list has "New branch…" and the local
+      branches.
+- [ ] Clicking another branch in the list checks it out; uncommitted changes that
       don't conflict come along.
 - [ ] A checkout that would overwrite local changes is refused with git's message naming the files,
       and nothing changes.
@@ -98,7 +111,25 @@ your own.
       deleted.
 - [ ] After a commit or a branch change, the selected commit in the history stays selected.
 
-## Commit tab: changes
+## Fetch, pull and push
+
+- [ ] The Push/Pull box shows what fits: "Fetch origin" / "Up to date", "Pull" / "Pull 3 commits"
+      when the remote has new commits, "Push" / "Push 2 commits" when you have unpushed commits,
+      "Publish branch" / "Not on origin yet" for a branch never pushed. Hovering says what it does.
+- [ ] A repository with no remote shows "No remote" (disabled, with the reason on hover).
+- [ ] Fetch (button or Ctrl+Shift+T) picks up commits pushed elsewhere: the button turns into Pull.
+- [ ] Pull (Ctrl+Shift+P) brings them in; the history and files update. It follows your git config
+      (merge, rebase or fast-forward only).
+- [ ] Push (Ctrl+P) sends your commits; on a new branch it publishes it (sets the upstream).
+- [ ] A push the remote refuses (it has commits you don't) says to pull first.
+- [ ] Repository → Force Push… asks first and names how many remote commits would be replaced. If the
+      remote changed since your last fetch, it is refused and nothing is overwritten.
+- [ ] While a network command runs: the box shows it with a spinner, and clicking it cancels; the rest of the app
+      keeps working; a second network command is refused; committing waits while a pull runs.
+- [ ] Cancel stops it ("Push cancelled.").
+- [ ] Pushing over HTTPS with Git Credential Manager shows its sign-in window when needed.
+
+## Changes view: changes
 
 - [ ] The changed files list a checkbox, the path from the repository root, and the change letter on
       the right.
@@ -107,9 +138,9 @@ your own.
 - [ ] The first file is selected and its diff shown. The divider can be dragged and survives a
       restart.
 - [ ] A modified, a deleted and an untracked file each show the right diff.
-- [ ] The list refreshes on F5, when the Commit tab is shown, and when the window gets the focus back.
+- [ ] The list refreshes on F5, when the Changes view is shown, and when the window gets the focus back.
 
-## Commit tab: committing
+## Changes view: committing
 
 - [ ] Every file starts ticked. The all/none box turns part-filled when the files are mixed.
 - [ ] Unticking a file and committing commits only the ticked files. The others stay, ticked again.
@@ -124,10 +155,10 @@ your own.
 - [ ] A failing pre-commit hook (`exit 1`) shows git's output under the button and keeps the message.
       **(not checked yet)**
 
-## Commit tab: picking lines
+## Changes view: picking lines
 
-- [ ] Each added or removed line in the Commit tab's diff has a checkbox; context lines don't. The
-      Repository tab's diff has no checkboxes.
+- [ ] Each added or removed line in the Changes view's diff has a checkbox; context lines don't. The
+      History view's diff has no checkboxes.
 - [ ] Unticking a line makes the file's box in the list part-filled; hovering it says only the
       ticked lines will be committed.
 - [ ] Each hunk header has a box: part-filled when some of its lines are ticked. Clicking it unticks
@@ -144,7 +175,7 @@ your own.
 - [ ] A file whose old last line had no newline: ticking only the new line after it gives a clear
       message under the Commit button, and nothing is committed.
 
-## Commit tab: discarding lines
+## Changes view: discarding lines
 
 - [ ] Right-click a line's checkbox in the diff: "Discard added line" (or "Discard removed line").
       Right-click a block's or hunk's checkbox: "Discard lines".
@@ -156,7 +187,7 @@ your own.
 - [ ] Works on a new (untracked) file, and on a file with Windows (CRLF) line endings.
 - [ ] A deleted file's boxes offer no discard (use "Discard changes…" on the file).
 
-## Commit tab: pre-staging (ticks saved)
+## Changes view: pre-staging (ticks saved)
 
 - [ ] Untick a file, close GitCraft and open it again: the file is still unticked.
 - [ ] Untick some lines of a file, restart: the same lines are unticked (the file's box part-filled).
@@ -170,7 +201,7 @@ your own.
       ticks were damaged, the file is renamed to `prestage.damaged`, and everything starts ticked.
 - [ ] Ticking or unticking doesn't flash "Loading…" in the status bar.
 
-## Commit tab: right-click menu
+## Changes view: right-click menu
 
 - [ ] Discard changes… asks first and names exactly what will be lost. Esc or a click outside cancels.
 - [ ] Discarding moves the current file to the Recycle Bin, then restores the committed version.
@@ -195,7 +226,7 @@ None of these have been checked yet.
 - [ ] The window opens under Wayland, and closing works.
 - [ ] Window size restore (the compositor may ignore it).
 - [ ] The last repository, branch and dividers reopen after a restart (`~/.config/gitcraft/config.toml`).
-- [ ] Commit tab: status and diffs, including file names containing `:` or a backslash.
-- [ ] Commit tab refreshes when the window gets the focus back.
+- [ ] Changes view: status and diffs, including file names containing `:` or a backslash.
+- [ ] Changes view refreshes when the window gets the focus back.
 - [ ] Right-click menu: Discard moves the file to the Trash; Show in file manager and Open use
       `xdg-open`; Choose a program works.

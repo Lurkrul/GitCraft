@@ -31,6 +31,16 @@ fn menu_bar(recent: &[RecentItem]) -> MenuBar {
     let mut bar = MenuBar {
         menus: vec![
             Menu::new("File", vec![item(Command::OpenRepository).into(), Node::submenu("Open Recent", recent_items(recent))]).role(MenuRole::File),
+            Menu::new(
+                "Repository",
+                vec![
+                    item(Command::Fetch).into(),
+                    item(Command::Pull).into(),
+                    item(Command::Push).into(),
+                    Node::Separator,
+                    item(Command::ForcePush).into(),
+                ],
+            ),
             Menu::new("Branch", vec![item(Command::NewBranch).into(), item(Command::RenameBranch).into()]),
             Menu::new("Help", vec![item(Command::About).into()]).role(MenuRole::Help),
         ],
@@ -135,6 +145,16 @@ mod tests {
         assert_eq!(new.shortcut, Command::NewBranch.shortcut());
         assert!(new.shortcut.is_some(), "Ctrl+Shift+N");
         assert!(bar.find(&Command::RenameBranch.command_ref()).is_some());
+    }
+
+    #[test]
+    fn the_repository_menu_has_the_sync_commands_with_their_shortcuts() {
+        let bar = laid_out(&[]);
+        for command in [Command::Fetch, Command::Pull, Command::Push] {
+            let item = bar.find(&command.command_ref()).unwrap_or_else(|| panic!("{command:?} in the menu"));
+            assert!(item.shortcut.is_some() && item.shortcut == command.shortcut(), "{command:?}");
+        }
+        assert!(bar.find(&Command::ForcePush.command_ref()).is_some_and(|item| item.shortcut.is_none()), "no shortcut for force push");
     }
 
     #[test]

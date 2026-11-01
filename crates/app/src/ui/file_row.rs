@@ -19,7 +19,7 @@ pub enum LetterSide {
 }
 
 /// Draws one row and returns its click response. `id_salt` must differ for each row of a list.
-/// `right` fills the right end of the row (line counts, say). The path is cut with "â€¦" if the
+/// `right` fills the right end of the row (line counts, say). The path is cut with "…" if the
 /// row is too narrow, so whatever is on the right always stays visible.
 #[allow(clippy::too_many_arguments)]
 pub fn show(

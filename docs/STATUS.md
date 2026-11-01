@@ -171,9 +171,9 @@ exactly like the command line. Submodules as designed (G7).
 | G3b | Line and hunk checkboxes in the Commit tab's diff (ticks in memory) | done (`86291a9`) |
 | G3c | Pre-staging: ticks saved in `.git/gitcraft/prestage`, surviving restarts | done (`ac4b603`) |
 | G4 | Discard single hunks, blocks and lines (whole files are done in G2b) | done (`cd2241f`) |
-| G5 | Branches: new, checkout, rename, delete (with confirmations) | done, not committed |
-| G6 | Repository menu: fetch, pull, push on a second worker; cancel; `--force-with-lease` only | next |
-| G7 | Submodules: Repository → Submodules menu, list, open with breadcrumb, Commit tab entries | |
+| G5 | Branches: new, checkout, rename, delete (with confirmations) | done (`f302b1c`) |
+| G6 | Repository menu: fetch, pull, push on a second worker; cancel; `--force-with-lease` only | done |
+| G7 | Submodules: Repository → Submodules menu, list, open with breadcrumb, Commit tab entries | next |
 
 G1 details:
 - Git layer: `status(repo)` runs `git status --porcelain=v2 -z --untracked-files=all --no-renames
@@ -349,6 +349,37 @@ the history filter, now labelled "Show:"; checking out a single commit (detached
 - Not done (proposed, left for later): right-clicking branch labels in the history; a search box in
   the Current branch dropdown; deleting branches on the remote (needs push, G6).
 
+G6 details:
+- Git layer (`remote.rs`): `sync_state` (remotes, checked-out branch, upstream unless gone,
+  ahead/behind from `rev-list --left-right --count`), `fetch` (`--all --prune`), `pull` (`--no-edit`;
+  follows the user's merge/rebase/ff config), `push` (normal or `--force-with-lease`, never `--force`),
+  `publish` (`push -u <remote> HEAD:refs/heads/<branch>`), `upstream_only_commits`. Network commands get a
+  10-minute limit and a cancel flag (`RunOptions::cancel`, checked before starting and while running).
+  Rejected pushes become `GitError::PushRejected` (pull first / stale lease). New `GitError::Cancelled`.
+- A second worker thread runs network commands, so local work (status, diffs, commits) carries on.
+  One network command at a time; while a pull runs, commits and branch changes wait.
+- Toolbar sync button (right end, both tabs): Fetch origin / Pull ↓n / Push ↑n / Publish branch,
+  whichever fits (pull before push, since a push would be refused); disabled with a reason for no remote
+  or a detached HEAD. While running: the action, a spinner and Cancel.
+- Repository menu: Fetch (Ctrl+Shift+T), Pull (Ctrl+Shift+P), Push (Ctrl+P; publishes a branch with no
+  upstream), Force Push… (asks first, naming how many remote commits would be replaced).
+- After any network command (done, failed or cancelled), branches, history, changes and sync state are
+  read again. The sync state is also read on opening and when the window gets the focus back.
+
+Layout rework (requested 2026-11-01, alongside G6, GitHub Desktop style):
+- Main tabs: Repository, Issues, Projects (the Commit tab is gone).
+- Toolbar (`ui/toolbar_box.rs`): big boxes with a label on top (normal text colour, slightly smaller) and the value larger below:
+  "Current repository" ▾, "Current branch" ▾ (lists in an `egui::Popup` that closes on a pick or a
+  click outside, so right-click menus inside work), then the Push/Pull box (title on top, status
+  below: "Push 2 commits", "Pull 3 commits", "Up to date"; while running, the action with a spinner,
+  and a click cancels). The arrow is drawn, since egui's fonts have no ▾. The "Show:" history
+  filter follows, in the History view only.
+- The left pane has Changes / History tabs at its top (`tabs::RepoView`; one generic tab strip draws
+  both strips). Changes is the old Commit tab; History is the old Repository tab. Both share one
+  divider position (`side_ratio`, read from `history_ratio` in older settings files); the view is
+  remembered (`history_view`). Opens on Changes the first time. Arrow keys move the history
+  selection only in History; showing Changes refreshes the file list.
+
 ## Feature checklist
 
 `docs/features.md` lists every feature as something to try in the app, for a full pass at the end.
@@ -381,8 +412,11 @@ Ideas agreed for later, not scheduled into a step yet.
   icon (Polish milestone; list it in ATTRIBUTION.md).
 - No way to load history past the first 10,000 commits yet.
 
-- Running git on a timeout leaves its reader threads blocked if a grandchild process (such as ssh)
-  keeps the pipes open. That only matters for network commands (Milestone 3), so revisit then.
+- A timed-out or cancelled network command is stopped at once, but if a grandchild process (ssh)
+  keeps git's pipes open, the two reader threads stay until it exits. Nothing waits on them (the UI
+  and workers carry on); it costs two idle threads. Killing the whole process tree would fix it.
+- SSH keys with a passphrase need an agent (ssh-agent, Pageant, the Windows OpenSSH agent): git runs
+  without a terminal, so ssh can't ask for the passphrase. HTTPS with a credential manager works.
 
 - The `[patch.crates-io]` lines in the root `Cargo.toml` must be updated whenever the craft-libs rev
   changes.

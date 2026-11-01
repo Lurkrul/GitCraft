@@ -16,5 +16,7 @@ pub mod ref_labels;
 pub mod repository;
 pub mod split;
 pub mod status_bar;
+pub mod sync;
 pub mod tabs;
 pub mod time;
+pub mod toolbar_box;

@@ -4,6 +4,8 @@
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,11 +23,19 @@ pub struct RunOptions {
     /// Exit codes besides 0 that mean success. `git diff --no-index` exits with 1 when the files
     /// differ, which is exactly the case we want.
     pub also_ok: &'static [i32],
+    /// Set to `true` (from another thread) to stop git early: the command then fails with
+    /// [`GitError::Cancelled`].
+    pub cancel: Option<CancelFlag>,
 }
+
+/// A shared "please stop" flag for a long-running command (a fetch or push). `Arc` shares it
+/// between the thread that runs git and the UI that sets it; `AtomicBool` makes setting and reading
+/// it safe without a lock, like `std::shared_ptr<std::atomic<bool>>` in C++.
+pub type CancelFlag = Arc<AtomicBool>;
 
 impl Default for RunOptions {
     fn default() -> Self {
-        Self { timeout: Duration::from_secs(60), max_output: 64 * 1024 * 1024, also_ok: &[] }
+        Self { timeout: Duration::from_secs(60), max_output: 64 * 1024 * 1024, also_ok: &[], cancel: None }
     }
 }
 
@@ -143,6 +153,10 @@ fn classify_failure(command: String, cwd: &Path, code: Option<i32>, stderr: &[u8
 /// deadlock: git would block writing to a full stderr pipe while we wait on stdout.
 pub(crate) fn run_process(mut command: Command, options: &RunOptions, name: &str, input: Option<Vec<u8>>) -> Result<ProcessOutput> {
     let io_error = |what: &str, source: io::Error| GitError::Io { context: format!("{name}: {what}"), source };
+    let cancelled = || options.cancel.as_ref().is_some_and(|flag| flag.load(Ordering::Relaxed));
+    if cancelled() {
+        return Err(GitError::Cancelled { command: name.to_string() });
+    }
 
     let mut child = command.spawn().map_err(|e| io_error("could not start", e))?;
     // `take()` moves each pipe out of `child`, so the reader thread can own it.
@@ -173,6 +187,10 @@ pub(crate) fn run_process(mut command: Command, options: &RunOptions, name: &str
             stop(&mut child);
             // Killing git closes its pipes, so the reader threads finish on their own.
             return Err(GitError::TimedOut { command: name.to_string(), after: options.timeout });
+        }
+        if cancelled() {
+            stop(&mut child);
+            return Err(GitError::Cancelled { command: name.to_string() });
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -259,6 +277,16 @@ mod tests {
         let options = RunOptions { timeout: Duration::ZERO, ..RunOptions::default() };
         let err = git().run_with(&std::env::temp_dir(), &["--version"], &options).unwrap_err();
         assert!(matches!(err, GitError::TimedOut { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_cancelled_command_stops_with_cancelled() {
+        let flag: CancelFlag = Arc::new(AtomicBool::new(true));
+        let options = RunOptions { cancel: Some(flag), ..RunOptions::default() };
+        let err = git().run_with(&std::env::temp_dir(), &["--version"], &options).unwrap_err();
+        assert!(matches!(err, GitError::Cancelled { .. }), "{err:?}");
+        let not_set = RunOptions { cancel: Some(Arc::new(AtomicBool::new(false))), ..RunOptions::default() };
+        assert!(git().run_with(&std::env::temp_dir(), &["--version"], &not_set).is_ok());
     }
 
     #[test]

@@ -3,12 +3,13 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use craft_dialogs::{Answer, Dialogs, FileDialog};
 use craft_menu::MenuBar;
 use craft_settings::{SaveStatus, SettingsStore};
-use gitcraft_git::{DEFAULT_LOG_LIMIT, DiffRequest, LogScope, Refs, Repo, WorkingDiffRequest};
+use gitcraft_git::{CancelFlag, DEFAULT_LOG_LIMIT, DiffRequest, LogScope, Refs, Repo, SyncState, WorkingDiffRequest};
 
 use crate::commands::Command;
 use crate::files;
@@ -24,7 +25,8 @@ use crate::ui::recent::{self, RecentItem, RepositoryPick};
 use crate::ui::ref_labels::{self, LabelMap};
 use crate::ui::repository::RepoLayout;
 use crate::ui::status_bar::StatusLine;
-use crate::ui::tabs::MainTab;
+use crate::ui::sync::{self, NetOp, SyncPick};
+use crate::ui::tabs::{MainTab, RepoView};
 use crate::ui::{about, menu, placeholder, repository, status_bar, tabs};
 use crate::worker::{Event, Job, Launch, Worker};
 
@@ -76,6 +78,8 @@ struct OpenRepo {
     /// Where the pre-stage file is kept, once found (`None` if git couldn't say: then nothing is
     /// saved, and the status bar says why).
     prestage_path: Option<PathBuf>,
+    /// Remotes, upstream and ahead/behind, for the sync button (`None` until read).
+    sync: Option<SyncState>,
 }
 
 impl OpenRepo {
@@ -97,6 +101,7 @@ impl OpenRepo {
             status_loading: false,
             status_again: false,
             prestage_path: None,
+            sync: None,
         }
     }
 
@@ -142,6 +147,10 @@ pub struct GitCraftApp {
     confirm: Option<Pending>,
     /// The dialog asking for a branch name (new branch, rename), while open.
     branch_dialog: Option<BranchDialog>,
+    /// The worker for network commands (fetch, pull, push).
+    net_worker: Option<Worker>,
+    /// The network command running, and its cancel flag.
+    net: Option<(NetOp, CancelFlag)>,
 }
 
 /// An action held back until the user confirms it.
@@ -154,6 +163,8 @@ enum Pending {
     DiscardLines { path: String, patch: Vec<u8>, question: Confirm },
     /// Deleting a local branch.
     DeleteBranch { name: String, question: Confirm },
+    /// Force pushing (with lease).
+    ForcePush(Confirm),
 }
 
 impl GitCraftApp {
@@ -164,18 +175,27 @@ impl GitCraftApp {
         // clone) so it can ask for a repaint when it has something new.
         let worker_ctx = ctx.clone();
         let dialog_ctx = ctx.clone();
+        let net_ctx = ctx.clone();
         let (worker, worker_error) = match Worker::spawn(Arc::new(move || worker_ctx.request_repaint())) {
             Ok(worker) => (Some(worker), None),
             Err(err) => (None, Some(format!("Could not start GitCraft's background worker: {err}"))),
+        };
+        // A second worker for fetch, pull and push: they can take minutes, and local work (status,
+        // diffs, commits) shouldn't wait behind them.
+        let (net_worker, net_error) = match Worker::spawn(Arc::new(move || net_ctx.request_repaint())) {
+            Ok(worker) => (Some(worker), None),
+            Err(err) => (None, Some(format!("Could not start GitCraft's network worker: {err}"))),
         };
         let layout = settings.get().layout.to_layout();
         let last_repository = settings.get().repositories.last();
         let mut app = Self {
             settings,
             worker,
+            net_worker,
+            net: None,
             dialogs: Dialogs::new(Arc::new(move || dialog_ctx.request_repaint())),
             open: None,
-            error: worker_error.or(startup_problem),
+            error: worker_error.or(net_error).or(startup_problem),
             menu_bar: menu::laid_out(&[]),
             recent: Vec::new(),
             missing_folders: BTreeSet::new(),
@@ -208,6 +228,10 @@ impl GitCraftApp {
                 let open = self.open.as_ref().map(|open| open.repo.root().to_path_buf());
                 self.settings.update(|prefs| prefs.repositories.clear_except(open.as_deref()));
             }
+            Command::Fetch => self.run_net(NetOp::Fetch),
+            Command::Pull => self.run_net(NetOp::Pull),
+            Command::Push => self.push(),
+            Command::ForcePush => self.ask_force_push(),
             Command::NewBranch => self.handle_branch_pick(BranchPick::New { from: None }),
             Command::RenameBranch => {
                 let current = self
@@ -350,13 +374,20 @@ impl GitCraftApp {
         // before `handle_event` can borrow all of `self`.
         let (events, alive) = match self.worker.as_mut() {
             Some(worker) => (worker.poll(), worker.is_alive()),
-            None => return,
+            None => (Vec::new(), false),
         };
-        for event in events {
+        let (net_events, net_alive) = match self.net_worker.as_mut() {
+            Some(worker) => (worker.poll(), worker.is_alive()),
+            None => (Vec::new(), false),
+        };
+        for event in events.into_iter().chain(net_events) {
             self.handle_event(event);
         }
-        if !alive {
-            self.worker = None;
+        if !alive && self.worker.take().is_some() {
+            self.error = Some(WORKER_STOPPED.to_string());
+        }
+        if !net_alive && self.net_worker.take().is_some() {
+            self.net = None;
             self.error = Some(WORKER_STOPPED.to_string());
         }
     }
@@ -385,6 +416,7 @@ impl GitCraftApp {
                 if let Some(repo) = self.open.as_ref().map(|open| open.repo.clone()) {
                     self.send(Job::LoadPrestage { repo });
                 }
+                self.load_sync();
                 self.refresh_status();
             }
             Event::PrestageLoaded { repo, path, result } => {
@@ -474,6 +506,42 @@ impl GitCraftApp {
                         }
                     }
                     Err(error) => self.error = Some(format!("Could not read the branches and history again: {error}")),
+                }
+            }
+            Event::SyncLoaded { repo, result } => {
+                if let Some(open) = self.open.as_mut().filter(|open| open.repo == repo) {
+                    match result {
+                        Ok(sync) => open.sync = Some(sync),
+                        Err(error) => {
+                            open.sync = None;
+                            self.error = Some(format!("Could not read the remotes: {error}"));
+                        }
+                    }
+                }
+            }
+            Event::NetDone { repo, op, result } => {
+                self.net = None;
+                if !self.open.as_ref().is_some_and(|open| open.repo == repo) {
+                    return;
+                }
+                match result {
+                    Ok(()) => {}
+                    Err(gitcraft_git::GitError::Cancelled { .. }) => self.error = Some(format!("{} cancelled.", net_name(&op))),
+                    Err(error) => self.error = Some(format!("{}: {error}", op.failed())),
+                }
+                // Even a failed or cancelled command may have changed something (a fetch that got
+                // halfway, a pull that stopped on a conflict): read it all again.
+                self.reload();
+                self.refresh_status();
+            }
+            Event::UpstreamOnlyCounted { repo, result } => {
+                let Some(open) = self.open.as_ref().filter(|open| open.repo == repo) else {
+                    return;
+                };
+                let upstream = open.sync.as_ref().and_then(|sync| sync.upstream.clone()).unwrap_or_else(|| "the remote branch".into());
+                match result {
+                    Ok(count) => self.confirm = Some(Pending::ForcePush(force_push_question(&upstream, count))),
+                    Err(error) => self.error = Some(format!("Could not check what a force push would replace: {error}")),
                 }
             }
             Event::PrestageSaved { result } => {
@@ -755,17 +823,21 @@ impl GitCraftApp {
         for choice in chosen {
             self.handle_menu_choice(choice);
         }
-        let tab_before = self.tab;
         egui::Panel::top("tabs").show(ui, |ui| tabs::show(ui, &mut self.tab));
-        if self.tab == MainTab::Commit && tab_before != MainTab::Commit {
-            // Files may have changed since the list was read.
-            self.refresh_status();
-        }
-        if let (MainTab::Repository | MainTab::Commit, Some(open)) = (self.tab, &self.open) {
-            let show_filter = self.tab == MainTab::Repository;
-            let picked = egui::Panel::top("repository_toolbar")
-                .show(ui, |ui| repository::toolbar(ui, open.repo.root(), &open.refs, &open.selected_scope, &self.recent, show_filter))
-                .inner;
+        // Changes and History are picked inside the Repository tab (drawn below); Changes being
+        // shown again is noticed at the end of the frame.
+        let changes_before = self.showing_changes();
+        if let (MainTab::Repository, Some(open)) = (self.tab, &self.open) {
+            let view = repository::ToolbarView {
+                root: open.repo.root(),
+                refs: &open.refs,
+                selected: &open.selected_scope,
+                recent: &self.recent,
+                show_filter: self.layout.view == RepoView::History,
+                sync: open.sync.as_ref(),
+                running: self.net.as_ref().map(|(op, _)| op),
+            };
+            let picked = egui::Panel::top("repository_toolbar").show(ui, |ui| repository::toolbar(ui, &view)).inner;
             // Acted on after the panel closure ends, when `open` (a borrow of `self.open`) is no
             // longer in use and `self` can be changed.
             match picked {
@@ -773,6 +845,8 @@ impl GitCraftApp {
                 Some(repository::ToolbarPick::Repository(RepositoryPick::Open(path))) => self.open_recent(path),
                 Some(repository::ToolbarPick::Repository(RepositoryPick::Other)) => self.run(Command::OpenRepository),
                 Some(repository::ToolbarPick::Branch(pick)) => self.handle_branch_pick(pick),
+                Some(repository::ToolbarPick::Sync(SyncPick::Run(op))) => self.run_net(op),
+                Some(repository::ToolbarPick::Sync(SyncPick::Cancel)) => self.cancel_net(),
                 None => {}
             }
         }
@@ -784,6 +858,10 @@ impl GitCraftApp {
         let programs = self.settings.get().open_with.programs();
         let pick = egui::CentralPanel::default()
             .show(ui, |ui| match (self.tab, &mut self.open) {
+                (MainTab::Repository, Some(open)) if self.layout.view == RepoView::Changes => {
+                    let RepoLayout { side_ratio, view, .. } = &mut self.layout;
+                    commit_tab::show(ui, &mut open.changes, side_ratio, view, &programs).map(Picked::Commit)
+                }
                 (MainTab::Repository, Some(open)) => {
                     let view = repository::BodyView {
                         history: &open.history,
@@ -798,15 +876,6 @@ impl GitCraftApp {
                 }
                 (MainTab::Repository, None) => {
                     repository::welcome(ui);
-                    None
-                }
-                (MainTab::Commit, Some(open)) => {
-                    commit_tab::show(ui, &mut open.changes, &mut self.layout.changes_ratio, &programs).map(Picked::Commit)
-                }
-                (MainTab::Commit, None) => {
-                    ui.centered_and_justified(|ui| {
-                        ui.weak("Open a repository to see its changes.");
-                    });
                     None
                 }
                 (MainTab::Issues, _) => {
@@ -837,11 +906,20 @@ impl GitCraftApp {
             }
             None => {}
         }
+        if self.showing_changes() && !changes_before {
+            // Files may have changed since the list was read.
+            self.refresh_status();
+        }
         self.save_prestage_if_changed();
         about::show(ui.ctx(), &mut self.about_open);
         self.show_confirmation(ui.ctx());
         self.show_branch_dialog(ui.ctx());
         self.remember_layout();
+    }
+
+    /// The Changes view is on screen.
+    fn showing_changes(&self) -> bool {
+        self.tab == MainTab::Repository && self.layout.view == RepoView::Changes
     }
 
     /// Acts on something picked in the Current branch dropdown (or the Branch menu).
@@ -869,6 +947,17 @@ impl GitCraftApp {
 
     /// Hands a branch change to the worker.
     fn change_branch(&mut self, op: BranchOp) {
+        if self.pulling() {
+            let message = "Wait for the pull to finish first.".to_string();
+            match self.branch_dialog.as_mut() {
+                Some(dialog) => {
+                    dialog.busy = false;
+                    dialog.error = Some(message);
+                }
+                None => self.error = Some(message),
+            }
+            return;
+        }
         if let Some(open) = &self.open {
             let job = Job::Branch { repo: open.repo.clone(), op };
             self.send(job);
@@ -882,6 +971,74 @@ impl GitCraftApp {
             let job = Job::Reload { repo: open.repo.clone(), scope: open.selected_scope.clone() };
             self.send(job);
         }
+        self.load_sync();
+    }
+
+    /// Reads the remotes, upstream and ahead/behind counts again (for the sync button).
+    fn load_sync(&mut self) {
+        if let Some(open) = &self.open {
+            let job = Job::LoadSync { repo: open.repo.clone() };
+            self.send(job);
+        }
+    }
+
+    /// Starts a fetch, pull or push on the network worker (one at a time).
+    fn run_net(&mut self, op: NetOp) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        if let Some((running, _)) = &self.net {
+            self.error = Some(format!("Wait for the current {} to finish (or cancel it).", net_name(running).to_lowercase()));
+            return;
+        }
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let job = Job::Net { repo: open.repo.clone(), op: op.clone(), cancel: cancel.clone() };
+        if self.net_worker.as_mut().is_some_and(|worker| worker.send(job)) {
+            self.net = Some((op, cancel));
+        } else {
+            self.net_worker = None;
+            self.error = Some(WORKER_STOPPED.to_string());
+        }
+    }
+
+    /// Asks the running network command to stop.
+    fn cancel_net(&mut self) {
+        if let Some((_, cancel)) = &self.net {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// A pull is changing the working tree: commits and checkouts must wait.
+    fn pulling(&self) -> bool {
+        matches!(self.net, Some((NetOp::Pull, _)))
+    }
+
+    /// Push: an ordinary push, or a first one (publish) for a branch without an upstream.
+    fn push(&mut self) {
+        let op = match self.open.as_ref().and_then(|open| open.sync.as_ref()) {
+            Some(sync) if sync.upstream.is_none() => match sync::suggestion(Some(sync)).op {
+                Some(op @ NetOp::Publish { .. }) => op,
+                _ => {
+                    self.error = Some(sync::suggestion(Some(sync)).tooltip);
+                    return;
+                }
+            },
+            _ => NetOp::Push,
+        };
+        self.run_net(op);
+    }
+
+    /// Force push: first count what it would take off the remote, then ask.
+    fn ask_force_push(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        if open.sync.as_ref().is_some_and(|sync| sync.upstream.is_none()) {
+            self.error = Some("This branch has no upstream to force push to. Publish it with Push first.".into());
+            return;
+        }
+        let job = Job::CountUpstreamOnly { repo: open.repo.clone() };
+        self.send(job);
     }
 
     /// Shows the branch name dialog, if open, and acts on the answer.
@@ -908,7 +1065,8 @@ impl GitCraftApp {
                 Pending::AmendPushed(question)
                 | Pending::Discard { question, .. }
                 | Pending::DiscardLines { question, .. }
-                | Pending::DeleteBranch { question, .. },
+                | Pending::DeleteBranch { question, .. }
+                | Pending::ForcePush(question),
             ) => question,
             None => return,
         };
@@ -931,6 +1089,7 @@ impl GitCraftApp {
                 }
             }
             Some(Pending::DeleteBranch { name, .. }) => self.change_branch(BranchOp::Delete { name }),
+            Some(Pending::ForcePush(_)) => self.run_net(NetOp::ForcePush),
             Some(Pending::DiscardLines { path, patch, .. }) => {
                 if let Some(open) = &self.open {
                     let job = Job::DiscardLines { repo: open.repo.clone(), path, patch };
@@ -992,6 +1151,10 @@ impl GitCraftApp {
     /// Commits what is ticked in the Commit tab. Amending a commit that is already on a remote
     /// asks first (unless `confirmed`), since it rewrites published history.
     fn start_commit(&mut self, confirmed: bool) {
+        if self.pulling() {
+            self.error = Some("Wait for the pull to finish before committing.".into());
+            return;
+        }
         let Some(open) = self.open.as_mut() else {
             return;
         };
@@ -1133,6 +1296,7 @@ impl GitCraftApp {
             // A drive may have been connected or a folder deleted meanwhile: check the recent
             // repositories again on the next frame.
             self.checked_folders.clear();
+            self.load_sync();
         }
         if focused || f5 {
             self.refresh_status();
@@ -1142,6 +1306,7 @@ impl GitCraftApp {
     /// ↑ and ↓ move the selection through the history while nothing else wants the keys.
     fn handle_arrow_keys(&mut self, ctx: &egui::Context) {
         let busy_elsewhere = self.tab != MainTab::Repository
+            || self.layout.view != RepoView::History
             || craft_menu::bar::is_open(ctx)
             || self.dialogs.is_open()
             || self.about_open
@@ -1199,6 +1364,41 @@ impl eframe::App for GitCraftApp {
 
 /// The status bar text for a repository that failed to open. Most git errors already name the
 /// folder; repeating it would make a long path appear twice.
+/// A network command's name, for messages ("Push cancelled.").
+fn net_name(op: &NetOp) -> &'static str {
+    match op {
+        NetOp::Fetch => "Fetch",
+        NetOp::Pull => "Pull",
+        NetOp::Push => "Push",
+        NetOp::ForcePush => "Force push",
+        NetOp::Publish { .. } => "Publish",
+    }
+}
+
+/// The question before a force push: what it would take off the remote branch.
+fn force_push_question(upstream: &str, upstream_only: usize) -> Confirm {
+    let lease =
+        "GitCraft uses --force-with-lease: if the remote branch changed since your last fetch, the push is refused and nothing is overwritten.";
+    if upstream_only == 0 {
+        return Confirm {
+            title: "Force push?".into(),
+            body: format!(
+                "Your branch will replace {upstream}. As of the last fetch it has no commits your branch lacks, so nothing is lost. {lease}"
+            ),
+            action: "Force push".into(),
+        };
+    }
+    let commits = if upstream_only == 1 { "1 commit".to_string() } else { format!("{upstream_only} commits") };
+    Confirm {
+        title: "Force push and replace remote commits?".into(),
+        body: format!(
+            "{upstream} has {commits} that your branch doesn't. Force pushing replaces the remote branch with yours, so {} removed from it (anyone who already has them keeps their copy). {lease}",
+            if upstream_only == 1 { "that commit is" } else { "those commits are" }
+        ),
+        action: format!("Force push and replace {commits}"),
+    }
+}
+
 /// The question before deleting a branch: plain when nothing is lost, stronger (naming how many
 /// commits) when some commits are on no other branch, tag or remote branch.
 fn delete_branch_question(name: &str, only_on: usize) -> Confirm {
@@ -1377,7 +1577,7 @@ mod tests {
     /// Runs frames until the background worker has nothing left to do.
     /// Whether the worker has anything left to do, quiet jobs (saves, folder checks) included.
     fn has_work(app: &GitCraftApp) -> bool {
-        app.worker.as_ref().is_some_and(Worker::has_work)
+        app.worker.as_ref().is_some_and(Worker::has_work) || app.net_worker.as_ref().is_some_and(Worker::has_work)
     }
 
     fn settle(app: &mut GitCraftApp, ctx: &egui::Context) {
@@ -1600,6 +1800,153 @@ mod tests {
         assert_eq!(std::fs::read_to_string(repo.path().join("f.txt")).unwrap(), "my edit\n");
     }
 
+    /// A repository pushed to a bare "origin" (kept alive by the returned folder).
+    fn repo_with_origin() -> (TestRepo, tempfile::TempDir, PathBuf) {
+        let repo = TestRepo::with_commits(&[]);
+        repo.commit_files(&[("f.txt", "root\n")], "Root");
+        let origin_dir = tempfile::tempdir().unwrap();
+        let origin = origin_dir.path().join("origin.git");
+        repo.git(&["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
+        repo.git(&["remote", "add", "origin", origin.to_str().unwrap()]);
+        repo.git(&["push", "-q", "-u", "origin", "main"]);
+        (repo, origin_dir, origin)
+    }
+
+    /// Someone else pushes a commit (with a new file `name`) to origin's main.
+    fn someone_else_pushes(origin: &std::path::Path, name: &str) {
+        let other = TestRepo::with_commits(&[]);
+        other.git(&["remote", "add", "origin", origin.to_str().unwrap()]);
+        other.git(&["fetch", "-q", "origin"]);
+        other.git(&["checkout", "-q", "-B", "main", "origin/main"]);
+        other.commit_files(&[(name, "theirs\n")], "Theirs");
+        other.git(&["push", "-q", "origin", "main"]);
+    }
+
+    fn sync_of(app: &GitCraftApp) -> SyncState {
+        app.open.as_ref().and_then(|open| open.sync.clone()).expect("sync state read")
+    }
+
+    #[test]
+    fn push_fetch_and_pull_through_the_sync_commands() {
+        let (repo, _keep, origin) = repo_with_origin();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        settle(&mut app, &ctx);
+        assert_eq!(sync_of(&app).upstream.as_deref(), Some("origin/main"));
+        assert_eq!(sync::suggestion(Some(&sync_of(&app))).status, "Up to date");
+
+        repo.commit_files(&[("g.txt", "mine\n")], "Mine");
+        app.reload();
+        settle(&mut app, &ctx);
+        assert_eq!(sync::suggestion(Some(&sync_of(&app))).status, "Push 1 commit");
+        app.run(Command::Push);
+        assert!(app.net.is_some(), "running");
+        settle(&mut app, &ctx);
+        assert!(app.net.is_none());
+        assert_eq!(repo.git(&["rev-parse", "origin/main"]), repo.git(&["rev-parse", "HEAD"]), "pushed");
+        assert_eq!(sync_of(&app).ahead, 0);
+
+        someone_else_pushes(&origin, "theirs.txt");
+        app.run(Command::Fetch);
+        settle(&mut app, &ctx);
+        assert_eq!(sync::suggestion(Some(&sync_of(&app))).status, "Pull 1 commit");
+        app.run(Command::Pull);
+        settle(&mut app, &ctx);
+        assert_eq!(std::fs::read_to_string(repo.path().join("theirs.txt")).unwrap(), "theirs\n");
+        assert_eq!(sync_of(&app).behind, 0);
+        assert_eq!(summaries(&app)[0], "Theirs", "the history shows the pulled commit");
+        assert!(matches!(app.status_line(), StatusLine::Info(_)), "no error");
+    }
+
+    #[test]
+    fn a_new_branch_is_published_by_push() {
+        let (repo, _keep, _origin) = repo_with_origin();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.handle_branch_pick(BranchPick::New { from: None });
+        app.branch_dialog.as_mut().unwrap().name = "feature".into();
+        submit_branch_dialog(&mut app, &ctx);
+        assert_eq!(sync::suggestion(Some(&sync_of(&app))).title, "Publish branch");
+        app.run(Command::Push);
+        settle(&mut app, &ctx);
+        assert_eq!(sync_of(&app).upstream.as_deref(), Some("origin/feature"));
+    }
+
+    #[test]
+    fn force_push_asks_first_and_respects_the_lease() {
+        let (repo, _keep, origin) = repo_with_origin();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        someone_else_pushes(&origin, "theirs.txt");
+        app.run(Command::Fetch);
+        settle(&mut app, &ctx);
+        repo.commit_files(&[("mine.txt", "mine\n")], "Mine");
+
+        // An ordinary push is refused, saying to pull.
+        app.run(Command::Push);
+        settle(&mut app, &ctx);
+        match app.status_line() {
+            StatusLine::Error(message) => assert!(message.contains("Pull first"), "{message}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        app.run(Command::ForcePush);
+        settle(&mut app, &ctx);
+        match &app.confirm {
+            Some(Pending::ForcePush(question)) => {
+                assert!(question.body.contains("origin/main has 1 commit") && question.action.contains("replace 1 commit"), "{question:?}");
+            }
+            _ => panic!("force pushing must ask first"),
+        }
+        // Someone pushes again meanwhile: the lease refuses to overwrite what we haven't seen.
+        someone_else_pushes(&origin, "more.txt");
+        app.run_pending();
+        settle(&mut app, &ctx);
+        match app.status_line() {
+            StatusLine::Error(message) => assert!(message.contains("changed since your last fetch"), "{message}"),
+            other => panic!("expected the lease to refuse, got {other:?}"),
+        }
+        // After a fetch it goes through.
+        app.run(Command::Fetch);
+        settle(&mut app, &ctx);
+        app.run(Command::ForcePush);
+        settle(&mut app, &ctx);
+        app.run_pending();
+        settle(&mut app, &ctx);
+        assert_eq!(repo.git(&["rev-parse", "origin/main"]), repo.git(&["rev-parse", "HEAD"]));
+    }
+
+    #[test]
+    fn network_commands_can_be_cancelled_and_block_commits_while_pulling() {
+        let (repo, _keep, _origin) = repo_with_origin();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.run(Command::Fetch);
+        app.run(Command::Pull);
+        assert!(matches!(app.status_line(), StatusLine::Error(message) if message.contains("Wait for the current fetch")), "one at a time");
+        app.cancel_net();
+        settle(&mut app, &ctx);
+        assert!(app.net.is_none(), "finished or cancelled, either way it is over");
+
+        // While a pull runs, commits wait.
+        app.net = Some((NetOp::Pull, Arc::new(AtomicBool::new(false))));
+        app.start_commit(false);
+        assert!(matches!(app.status_line(), StatusLine::Error(message) if message.contains("pull to finish")));
+        app.net = None;
+    }
+
+    #[test]
+    fn force_push_questions_say_what_is_replaced() {
+        let safe = force_push_question("origin/main", 0);
+        assert!(safe.body.contains("nothing is lost") && safe.body.contains("--force-with-lease") && safe.action == "Force push");
+        let risky = force_push_question("origin/main", 2);
+        assert!(risky.body.contains("2 commits") && risky.action == "Force push and replace 2 commits", "{risky:?}");
+    }
+
     #[test]
     fn picking_a_branch_shows_only_its_history() {
         let repo = repo_with_feature_branch();
@@ -1723,6 +2070,10 @@ mod tests {
         let mut app = test_app(&ctx);
         open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
 
+        // Only in the History view: in Changes the keys are left alone.
+        run_frame(&mut app, &ctx, press(egui::Key::ArrowDown));
+        assert_eq!(selected_summary(&app), None, "the Changes view is shown at first");
+        app.layout.view = RepoView::History;
         run_frame(&mut app, &ctx, press(egui::Key::ArrowDown));
         assert_eq!(selected_summary(&app).as_deref(), Some("Third"), "↓ with nothing selected picks the newest");
         run_frame(&mut app, &ctx, press(egui::Key::ArrowDown));
@@ -1948,13 +2299,11 @@ mod tests {
 
     #[test]
     fn the_layout_is_restored_and_saved() {
-        let prefs = Prefs {
-            layout: LayoutPrefs { history_ratio: 0.3, details_ratio: 0.7, details_expanded: false, changes_ratio: 0.25 },
-            ..Prefs::default()
-        };
+        let prefs =
+            Prefs { layout: LayoutPrefs { side_ratio: 0.3, details_ratio: 0.7, details_expanded: false, history_view: true }, ..Prefs::default() };
         let ctx = egui::Context::default();
         let mut app = app_with_prefs(&ctx, prefs);
-        assert_eq!(app.layout, RepoLayout { history_ratio: 0.3, details_ratio: 0.7, details_expanded: false, changes_ratio: 0.25 });
+        assert_eq!(app.layout, RepoLayout { side_ratio: 0.3, details_ratio: 0.7, details_expanded: false, view: RepoView::History });
 
         app.layout.details_expanded = true; // as if "More info" were clicked
         run_frame(&mut app, &ctx, egui::RawInput::default());
@@ -1984,7 +2333,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = test_app(&ctx);
         open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
-        app.tab = MainTab::Commit;
+        app.layout.view = RepoView::Changes;
         settle(&mut app, &ctx);
 
         assert_eq!(changed_paths(&app), ["a.txt", "c.txt"]);
@@ -2005,7 +2354,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = test_app(&ctx);
         open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
-        app.tab = MainTab::Commit;
+        app.layout.view = RepoView::Changes;
         settle(&mut app, &ctx);
         assert!(changed_paths(&app).is_empty());
         assert_eq!(selected_change(&app), None);
@@ -2081,7 +2430,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = test_app(&ctx);
         open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
-        app.tab = MainTab::Commit;
+        app.layout.view = RepoView::Changes;
         settle(&mut app, &ctx);
         assert_eq!(changed_paths(&app), ["first.txt"]);
         assert_eq!(working_diff_lines(&app).unwrap(), [(gitcraft_git::LineKind::Added, "hello".to_string())]);
@@ -2099,7 +2448,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = test_app(&ctx);
         open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
-        app.tab = MainTab::Commit;
+        app.layout.view = RepoView::Changes;
         settle(&mut app, &ctx);
 
         changes(&mut app).ticks.insert("later.txt".into(), commit_tab::Tick::Nothing);
@@ -2134,7 +2483,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = test_app(&ctx);
         open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
-        app.tab = MainTab::Commit;
+        app.layout.view = RepoView::Changes;
         settle(&mut app, &ctx);
         assert_eq!(selected_change(&app).as_deref(), Some("f.txt"));
 
@@ -2178,7 +2527,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = test_app(&ctx);
         open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
-        app.tab = MainTab::Commit;
+        app.layout.view = RepoView::Changes;
         settle(&mut app, &ctx);
 
         // Untick a whole file, and the second hunk of the other.
@@ -2191,7 +2540,7 @@ mod tests {
         assert_eq!(repo.git(&["diff", "--cached", "--name-only"]), "", "git's index is untouched");
 
         let (ctx, mut restarted) = restart(&app);
-        restarted.tab = MainTab::Commit;
+        restarted.layout.view = RepoView::Changes;
         settle(&mut restarted, &ctx);
         assert_eq!(changes(&mut restarted).tick("other.txt"), commit_tab::Tick::Nothing);
         assert_eq!(changes(&mut restarted).tick("f.txt"), commit_tab::Tick::Lines);
@@ -2220,7 +2569,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = test_app(&ctx);
         open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
-        app.tab = MainTab::Commit;
+        app.layout.view = RepoView::Changes;
         settle(&mut app, &ctx);
 
         // Right-click the second hunk's box → "Discard lines".
@@ -2250,7 +2599,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = test_app(&ctx);
         open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
-        app.tab = MainTab::Commit;
+        app.layout.view = RepoView::Changes;
         settle(&mut app, &ctx);
         match app.status_line() {
             StatusLine::Error(message) => assert!(message.contains("damaged"), "{message}"),
@@ -2269,7 +2618,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = test_app(&ctx);
         open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
-        app.tab = MainTab::Commit;
+        app.layout.view = RepoView::Changes;
         settle(&mut app, &ctx);
 
         // Untick the first block ("two" → "TWO") with its handle.

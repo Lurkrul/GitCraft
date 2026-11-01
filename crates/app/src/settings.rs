@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ui::repository::RepoLayout;
 use crate::ui::split;
+use crate::ui::tabs::RepoView;
 
 /// Smallest window we allow (also the window's minimum size).
 pub const MIN_WINDOW_SIZE: [f32; 2] = [480.0, 320.0];
@@ -57,13 +58,15 @@ impl WindowPrefs {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct LayoutPrefs {
-    /// The history's share of the width.
-    pub history_ratio: f64,
+    /// The Repository tab's left pane's share of the width (Changes and History share it). Files
+    /// from before they shared it call it `history_ratio`.
+    #[serde(alias = "history_ratio")]
+    pub side_ratio: f64,
     /// The details' share of the right pane's height.
     pub details_ratio: f64,
     pub details_expanded: bool,
-    /// The Commit tab's changed-files list's share of the width.
-    pub changes_ratio: f64,
+    /// The History view is shown (rather than Changes).
+    pub history_view: bool,
 }
 
 impl Default for LayoutPrefs {
@@ -78,10 +81,10 @@ impl From<&RepoLayout> for LayoutPrefs {
         // Rounded to 3 places in an f64 so the file reads `0.4`, not the f32's `0.4000000059604645`.
         let round = |ratio: f32| (f64::from(ratio) * 1000.0).round() / 1000.0;
         LayoutPrefs {
-            history_ratio: round(layout.history_ratio),
+            side_ratio: round(layout.side_ratio),
             details_ratio: round(layout.details_ratio),
             details_expanded: layout.details_expanded,
-            changes_ratio: round(layout.changes_ratio),
+            history_view: layout.view == RepoView::History,
         }
     }
 }
@@ -91,10 +94,10 @@ impl LayoutPrefs {
     pub fn to_layout(&self) -> RepoLayout {
         // `as f32` turns huge values into infinity and keeps NaN; `sane_ratio` handles both.
         RepoLayout {
-            history_ratio: split::sane_ratio(self.history_ratio as f32),
+            side_ratio: split::sane_ratio(self.side_ratio as f32),
             details_ratio: split::sane_ratio(self.details_ratio as f32),
             details_expanded: self.details_expanded,
-            changes_ratio: split::sane_ratio(self.changes_ratio as f32),
+            view: if self.history_view { RepoView::History } else { RepoView::Changes },
         }
     }
 }
@@ -345,25 +348,25 @@ mod tests {
 
     #[test]
     fn saved_ratios_are_rounded() {
-        let layout = RepoLayout { history_ratio: 0.4, details_ratio: 0.123_456, details_expanded: false, changes_ratio: 0.3 };
+        let layout = RepoLayout { side_ratio: 0.4, details_ratio: 0.123_456, details_expanded: false, view: RepoView::History };
         let prefs = LayoutPrefs::from(&layout);
-        assert_eq!((prefs.history_ratio, prefs.details_ratio), (0.4, 0.123));
+        assert_eq!((prefs.side_ratio, prefs.details_ratio, prefs.history_view), (0.4, 0.123, true));
     }
 
     #[test]
     fn damaged_ratios_are_made_sane() {
-        let prefs = LayoutPrefs { history_ratio: f64::NAN, details_ratio: 40.0, details_expanded: true, changes_ratio: -1.0 };
+        let prefs = LayoutPrefs { side_ratio: f64::NAN, details_ratio: 40.0, details_expanded: true, history_view: false };
         let layout = prefs.to_layout();
-        assert_eq!(layout.history_ratio, 0.5);
+        assert_eq!(layout.side_ratio, 0.5);
         assert_eq!(layout.details_ratio, 0.9);
         assert!(layout.details_expanded);
-        assert_eq!(layout.changes_ratio, 0.1);
+        assert_eq!(layout.view, RepoView::Changes);
     }
 
     #[test]
     fn layout_and_repositories_survive_a_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let layout = LayoutPrefs { history_ratio: 0.3, details_ratio: 0.6, details_expanded: true, changes_ratio: 0.2 };
+        let layout = LayoutPrefs { side_ratio: 0.3, details_ratio: 0.6, details_expanded: true, history_view: true };
         {
             let (mut store, _) = SettingsStore::<Prefs>::open_at(dir.path());
             store.update(|p| {
@@ -378,6 +381,16 @@ mod tests {
         assert_eq!(store.get().layout, layout);
         assert_eq!(store.get().repositories.last(), Some(root("a")));
         assert_eq!(store.get().repositories.branch_for(&root("a")), Some("refs/heads/main"));
+    }
+
+    #[test]
+    fn an_older_file_with_history_ratio_keeps_its_divider() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "schema_version = 1\n[layout]\nhistory_ratio = 0.42\nchanges_ratio = 0.3\n").unwrap();
+        let (store, report) = SettingsStore::<Prefs>::open_at(dir.path());
+        assert_eq!(load_problem_message(&report), None, "the old keys are fine");
+        assert_eq!(store.get().layout.side_ratio, 0.42);
+        assert!(!store.get().layout.history_view, "Changes is shown first");
     }
 
     #[test]

@@ -39,6 +39,11 @@ pub enum GitError {
     Unsupported(String),
     /// A branch name git doesn't allow.
     InvalidBranchName { name: String },
+    /// The user stopped the command.
+    Cancelled { command: String },
+    /// The remote refused a push: it has commits the branch doesn't (`stale`: for a force push,
+    /// it changed since the last fetch). `detail` is git's message.
+    PushRejected { stale: bool, detail: String },
 }
 
 impl fmt::Display for GitError {
@@ -70,6 +75,15 @@ impl fmt::Display for GitError {
             Self::OutputTooLarge { command, limit } => write!(f, "{command} produced more than {} MiB of output", limit / (1024 * 1024)),
             Self::Malformed { what, detail } => write!(f, "unexpected output from git ({what}): {detail}"),
             Self::Unsupported(message) => write!(f, "{message}"),
+            Self::Cancelled { command } => write!(f, "{command} was cancelled"),
+            Self::PushRejected { stale: false, .. } => write!(
+                f,
+                "The remote has commits that your branch doesn't have, so the push was refused. Pull first to bring them in (or use Force Push… if you mean to replace them)."
+            ),
+            Self::PushRejected { stale: true, .. } => write!(
+                f,
+                "The remote branch changed since your last fetch, so the force push was refused (nothing was overwritten). Fetch, look at what changed, then try again."
+            ),
             Self::InvalidBranchName { name } => write!(
                 f,
                 "\"{name}\" can't be a branch name. Branch names can't be empty, start with \"-\", contain spaces, \"..\" or any of \

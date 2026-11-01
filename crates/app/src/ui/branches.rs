@@ -3,9 +3,6 @@
 
 use gitcraft_git::Refs;
 
-/// Most rows the open dropdown shows before it scrolls.
-const DROPDOWN_HEIGHT: f32 = 400.0;
-
 /// A change to the local branches, carried out by the background worker. Names are short
 /// (`feature/login`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,41 +46,34 @@ pub fn current_label(refs: &Refs) -> String {
     }
 }
 
-/// The "Current branch" dropdown: "New branch…", then the local branches (the current one
-/// checked). Clicking a branch checks it out; right-clicking one offers more.
-pub fn current_branch(ui: &mut egui::Ui, refs: &Refs) -> Option<BranchPick> {
+/// The branch box's list: "New branch…", then the local branches (the current one marked).
+/// Clicking a branch checks it out; right-clicking one offers more.
+pub fn list(ui: &mut egui::Ui, refs: &Refs) -> Option<BranchPick> {
     let mut picked = None;
     let current = refs.head_branch().map(str::to_string);
-    craft_ui::ComboBox::from_id_salt("current-branch")
-        .selected_text(egui::RichText::new(current_label(refs)).strong())
-        .width(200.0)
-        .height(DROPDOWN_HEIGHT)
-        .show_ui(ui, |ui| {
-            if ui.button("New branch…").clicked() {
-                picked = Some(BranchPick::New { from: None });
-            }
-            ui.separator();
-            for branch in refs.branches() {
-                let is_current = current.as_deref() == Some(branch.name.as_str());
-                let name = branch.short_name().to_string();
-                let row = ui.add(egui::Button::selectable(is_current, &name)).on_hover_text(if is_current {
-                    "The checked-out branch. Right-click for more."
-                } else {
-                    "Click to check out. Right-click for more."
-                });
-                if row.clicked() && !is_current {
-                    picked = Some(BranchPick::Checkout(name.clone()));
-                }
-                row.context_menu(|ui| {
-                    if let Some(pick) = branch_menu(ui, &name, &branch.name, is_current) {
-                        picked = Some(pick);
-                    }
-                });
+    if ui.button("New branch…").clicked() {
+        picked = Some(BranchPick::New { from: None });
+    }
+    ui.separator();
+    for branch in refs.branches() {
+        let is_current = current.as_deref() == Some(branch.name.as_str());
+        let name = branch.short_name().to_string();
+        let row = ui.add(egui::Button::selectable(is_current, &name)).on_hover_text(if is_current {
+            "The checked-out branch. Right-click for more."
+        } else {
+            "Click to check out. Right-click for more."
+        });
+        if row.clicked() && !is_current {
+            picked = Some(BranchPick::Checkout(name.clone()));
+        }
+        row.context_menu(|ui| {
+            if let Some(pick) = branch_menu(ui, &name, &branch.name, is_current) {
+                picked = Some(pick);
             }
         });
+    }
     picked
 }
-
 /// A branch's right-click menu.
 fn branch_menu(ui: &mut egui::Ui, name: &str, full_name: &str, is_current: bool) -> Option<BranchPick> {
     let mut picked = None;
@@ -272,7 +262,7 @@ mod tests {
         for dialog_state in &mut dialogs {
             for _ in 0..2 {
                 let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                    assert_eq!(current_branch(ui, &refs), None);
+                    assert_eq!(list(ui, &refs), None);
                     assert_eq!(dialog(ui.ctx(), dialog_state), None, "no answer without input");
                 });
                 output.textures_delta.clear();

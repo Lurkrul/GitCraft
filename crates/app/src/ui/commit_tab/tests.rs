@@ -441,11 +441,12 @@ fn draws_every_state() {
     click_line(&mut partial, 0, 2, false);
     let mut states = [Changes::default(), failed, clean, sample(), busy, with_diff(PATCH), partial];
     let ctx = egui::Context::default();
-    let mut ratio = split::DEFAULT_CHANGES_RATIO;
+    let mut ratio = split::DEFAULT_SIDE_RATIO;
+    let mut view = RepoView::Changes;
     for changes in &mut states {
         for _ in 0..2 {
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                show(ui, changes, &mut ratio, &[PathBuf::from("editor")]);
+                show(ui, changes, &mut ratio, &mut view, &[PathBuf::from("editor")]);
             });
             output.textures_delta.clear();
         }

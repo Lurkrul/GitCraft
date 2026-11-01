@@ -6,9 +6,6 @@ use std::path::{Path, PathBuf};
 
 use crate::ui::repository::repository_name;
 
-/// Most rows the open dropdown shows before it scrolls.
-const DROPDOWN_HEIGHT: f32 = 400.0;
-
 /// One remembered repository, ready to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecentItem {
@@ -46,37 +43,29 @@ pub enum RepositoryPick {
     Other,
 }
 
-/// The toolbar's repository dropdown: the open repository's name (full path on hover); opened,
-/// the recent repositories and "Open other repository…".
-pub fn dropdown(ui: &mut egui::Ui, root: &Path, recent: &[RecentItem]) -> Option<RepositoryPick> {
+/// The repository box's list: the recent repositories (the open one marked, missing ones greyed
+/// out; full path on hover), then "Open other repository…".
+pub fn list(ui: &mut egui::Ui, recent: &[RecentItem]) -> Option<RepositoryPick> {
     let mut picked = None;
-    let response = craft_ui::ComboBox::from_id_salt("repository")
-        .selected_text(egui::RichText::new(repository_name(root)).strong())
-        .width(240.0)
-        .height(DROPDOWN_HEIGHT)
-        .show_ui(ui, |ui| {
-            for item in recent {
-                let row = ui.add_enabled(!item.missing, egui::Button::selectable(item.current, item.name()));
-                let row = if item.missing {
-                    row.on_disabled_hover_text(format!("{}\nThis folder can't be found.", item.path.display()))
-                } else {
-                    row.on_hover_text(item.path.display().to_string())
-                };
-                if row.clicked() && !item.current {
-                    picked = Some(RepositoryPick::Open(item.path.clone()));
-                }
-            }
-            if !recent.is_empty() {
-                ui.separator();
-            }
-            if ui.button("Open other repository…").clicked() {
-                picked = Some(RepositoryPick::Other);
-            }
-        });
-    response.response.on_hover_text(root.display().to_string());
+    for item in recent {
+        let row = ui.add_enabled(!item.missing, egui::Button::selectable(item.current, item.name()));
+        let row = if item.missing {
+            row.on_disabled_hover_text(format!("{}\nThis folder can't be found.", item.path.display()))
+        } else {
+            row.on_hover_text(item.path.display().to_string())
+        };
+        if row.clicked() && !item.current {
+            picked = Some(RepositoryPick::Open(item.path.clone()));
+        }
+    }
+    if !recent.is_empty() {
+        ui.separator();
+    }
+    if ui.button("Open other repository…").clicked() {
+        picked = Some(RepositoryPick::Other);
+    }
     picked
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,12 +84,12 @@ mod tests {
     }
 
     #[test]
-    fn the_dropdown_draws_with_and_without_entries() {
+    fn the_list_draws_with_and_without_entries() {
         let ctx = egui::Context::default();
-        let list = items(&[path("a"), path("b")], Some(&path("a")), &BTreeSet::from([path("b")]));
-        for recent in [list.as_slice(), &[]] {
+        let entries = items(&[path("a"), path("b")], Some(&path("a")), &BTreeSet::from([path("b")]));
+        for recent in [entries.as_slice(), &[]] {
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                assert_eq!(dropdown(ui, &path("a"), recent), None, "nothing picked without a click");
+                assert_eq!(list(ui, recent), None, "nothing picked without a click");
             });
             output.textures_delta.clear();
         }
