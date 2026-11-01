@@ -15,6 +15,7 @@ use crate::files;
 use crate::graph::History;
 use crate::prestage::Prestage;
 use crate::settings::{LayoutPrefs, Prefs};
+use crate::ui::branches::{self, BranchDialog, BranchOp, BranchPick, DialogAnswer};
 use crate::ui::commit_tab::{self, Changes};
 use crate::ui::confirm::{self, Choice, Confirm};
 use crate::ui::details::DetailsState;
@@ -139,6 +140,8 @@ pub struct GitCraftApp {
     scroll_to: Option<usize>,
     /// A question waiting for the user's answer before something irreversible happens.
     confirm: Option<Pending>,
+    /// The dialog asking for a branch name (new branch, rename), while open.
+    branch_dialog: Option<BranchDialog>,
 }
 
 /// An action held back until the user confirms it.
@@ -149,6 +152,8 @@ enum Pending {
     Discard { path: String, tracked: bool, question: Confirm },
     /// Discarding some lines of a file.
     DiscardLines { path: String, patch: Vec<u8>, question: Confirm },
+    /// Deleting a local branch.
+    DeleteBranch { name: String, question: Confirm },
 }
 
 impl GitCraftApp {
@@ -181,6 +186,7 @@ impl GitCraftApp {
             layout,
             scroll_to: None,
             confirm: None,
+            branch_dialog: None,
         };
         // Reopen the repository from last time. If it has gone (deleted, or on a drive that isn't
         // plugged in), the status bar says so and the welcome page shows.
@@ -201,6 +207,18 @@ impl GitCraftApp {
             Command::ClearRecent => {
                 let open = self.open.as_ref().map(|open| open.repo.root().to_path_buf());
                 self.settings.update(|prefs| prefs.repositories.clear_except(open.as_deref()));
+            }
+            Command::NewBranch => self.handle_branch_pick(BranchPick::New { from: None }),
+            Command::RenameBranch => {
+                let current = self
+                    .open
+                    .as_ref()
+                    .and_then(|open| open.refs.head_branch())
+                    .map(|name| name.strip_prefix("refs/heads/").unwrap_or(name).to_string());
+                match current {
+                    Some(name) => self.handle_branch_pick(BranchPick::Rename(name)),
+                    None => self.error = Some("There is no checked-out branch to rename (HEAD is detached).".into()),
+                }
             }
             Command::About => self.about_open = true,
         }
@@ -248,7 +266,7 @@ impl GitCraftApp {
     /// Runs commands whose keyboard shortcut was pressed this frame. Skipped while a menu or a
     /// dialog has the keyboard, so the keys go to them instead.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if craft_menu::bar::is_open(ctx) || self.dialogs.is_open() || self.about_open || self.confirm.is_some() {
+        if craft_menu::bar::is_open(ctx) || self.dialogs.is_open() || self.about_open || self.confirm.is_some() || self.branch_dialog.is_some() {
             return;
         }
         // If the keyboard is on the menu bar (after a tap on Alt), a shortcut leaves it and runs.
@@ -382,6 +400,82 @@ impl GitCraftApp {
                     }
                 }
             }
+            Event::BranchChanged { repo, op, result } => {
+                let Some(open) = self.open.as_mut().filter(|open| open.repo == repo) else {
+                    return;
+                };
+                match result {
+                    Ok(()) => {
+                        self.branch_dialog = None;
+                        // The history filter follows a renamed branch, and lets go of a deleted one.
+                        let root = open.repo.root().to_path_buf();
+                        let shown = |name: &str| open.selected_scope == LogScope::Ref(format!("refs/heads/{name}"));
+                        let follow = match &op {
+                            BranchOp::Rename { old, new } if shown(old) => Some(LogScope::Ref(format!("refs/heads/{new}"))),
+                            BranchOp::Delete { name } if shown(name) => Some(LogScope::AllBranches),
+                            _ => None,
+                        };
+                        if let Some(scope) = follow {
+                            let branch = match &scope {
+                                LogScope::Ref(name) => Some(name.clone()),
+                                LogScope::AllBranches => None,
+                            };
+                            open.selected_scope = scope;
+                            self.settings.update(|prefs| prefs.repositories.set_branch(&root, branch));
+                        }
+                        self.reload();
+                        // Checking out changes the working tree; creating a branch changes the
+                        // Commit button's label.
+                        self.refresh_status();
+                    }
+                    Err(error) => {
+                        let message = match &op {
+                            BranchOp::Create { name, .. } => format!("Could not create the branch \"{name}\": {error}"),
+                            BranchOp::Switch { name } => format!("Could not check out \"{name}\": {error}"),
+                            BranchOp::Rename { old, .. } => format!("Could not rename \"{old}\": {error}"),
+                            BranchOp::Delete { name } => format!("Could not delete \"{name}\": {error}"),
+                        };
+                        // Shown in the dialog if it is open (it stays open to try another name).
+                        match self.branch_dialog.as_mut() {
+                            Some(dialog) => {
+                                dialog.busy = false;
+                                dialog.error = Some(message);
+                            }
+                            None => self.error = Some(message),
+                        }
+                    }
+                }
+            }
+            Event::OnlyOnCounted { repo, name, result } => {
+                if !self.open.as_ref().is_some_and(|open| open.repo == repo) {
+                    return;
+                }
+                match result {
+                    Ok(count) => self.confirm = Some(Pending::DeleteBranch { question: delete_branch_question(&name, count), name }),
+                    Err(error) => self.error = Some(format!("Could not check what deleting \"{name}\" would lose: {error}")),
+                }
+            }
+            Event::Reloaded { repo, scope, result } => {
+                let Some(open) = self.open.as_mut().filter(|open| open.repo == repo && open.selected_scope == scope) else {
+                    return;
+                };
+                match result {
+                    Ok((refs, history)) => {
+                        open.labels = ref_labels::label_map(&refs);
+                        open.refs = refs;
+                        open.history = history;
+                        open.log_scope = scope;
+                        // The selection stays if the commit is still in the history.
+                        if open.selected_row().is_none() {
+                            open.selected = None;
+                            open.details = DetailsState::Empty;
+                            open.selected_file = None;
+                            open.diff = DiffState::Empty;
+                        }
+                    }
+                    Err(error) => self.error = Some(format!("Could not read the branches and history again: {error}")),
+                }
+            }
             Event::PrestageSaved { result } => {
                 if let Err(message) = result {
                     self.error = Some(message);
@@ -433,15 +527,15 @@ impl GitCraftApp {
                             (Some(prestage), Some(path)) => Some(Job::SavePrestage { path, prestage }),
                             _ => None,
                         };
-                        // The new commit changes the branch, the history and the working tree:
-                        // read the whole repository again (the saved branch is kept).
-                        let root = open.repo.root().to_path_buf();
                         // `open` (a borrow of `self.open`) is no longer used past here, so `self`
                         // can be borrowed again to send the jobs.
                         if let Some(job) = save {
                             self.send(job);
                         }
-                        self.open_folder(root);
+                        // The new commit changes the branch, the history and the working tree:
+                        // read them again (the repository stays open, the selection stays).
+                        self.reload();
+                        self.refresh_status();
                     }
                     Err(error) => {
                         open.changes.committing = false;
@@ -667,9 +761,10 @@ impl GitCraftApp {
             // Files may have changed since the list was read.
             self.refresh_status();
         }
-        if let (MainTab::Repository, Some(open)) = (self.tab, &self.open) {
+        if let (MainTab::Repository | MainTab::Commit, Some(open)) = (self.tab, &self.open) {
+            let show_filter = self.tab == MainTab::Repository;
             let picked = egui::Panel::top("repository_toolbar")
-                .show(ui, |ui| repository::toolbar(ui, open.repo.root(), &open.refs, &open.selected_scope, &self.recent))
+                .show(ui, |ui| repository::toolbar(ui, open.repo.root(), &open.refs, &open.selected_scope, &self.recent, show_filter))
                 .inner;
             // Acted on after the panel closure ends, when `open` (a borrow of `self.open`) is no
             // longer in use and `self` can be changed.
@@ -677,6 +772,7 @@ impl GitCraftApp {
                 Some(repository::ToolbarPick::Scope(scope)) => self.select_scope(scope),
                 Some(repository::ToolbarPick::Repository(RepositoryPick::Open(path))) => self.open_recent(path),
                 Some(repository::ToolbarPick::Repository(RepositoryPick::Other)) => self.run(Command::OpenRepository),
+                Some(repository::ToolbarPick::Branch(pick)) => self.handle_branch_pick(pick),
                 None => {}
             }
         }
@@ -744,13 +840,76 @@ impl GitCraftApp {
         self.save_prestage_if_changed();
         about::show(ui.ctx(), &mut self.about_open);
         self.show_confirmation(ui.ctx());
+        self.show_branch_dialog(ui.ctx());
         self.remember_layout();
+    }
+
+    /// Acts on something picked in the Current branch dropdown (or the Branch menu).
+    fn handle_branch_pick(&mut self, pick: BranchPick) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        match pick {
+            BranchPick::Checkout(name) => self.change_branch(BranchOp::Switch { name }),
+            BranchPick::New { from } => {
+                let label = match &from {
+                    Some(full) => full.strip_prefix("refs/heads/").unwrap_or(full).to_string(),
+                    None => branches::current_label(&open.refs),
+                };
+                self.branch_dialog = Some(BranchDialog::new_branch(from, label));
+            }
+            BranchPick::Rename(name) => self.branch_dialog = Some(BranchDialog::rename(name)),
+            // The warning needs to know what would be lost: counted first, then asked.
+            BranchPick::Delete(name) => {
+                let job = Job::CountOnlyOn { repo: open.repo.clone(), name };
+                self.send(job);
+            }
+        }
+    }
+
+    /// Hands a branch change to the worker.
+    fn change_branch(&mut self, op: BranchOp) {
+        if let Some(open) = &self.open {
+            let job = Job::Branch { repo: open.repo.clone(), op };
+            self.send(job);
+        }
+    }
+
+    /// Reads the branches and history again after they changed (a commit, a branch change),
+    /// keeping the repository open and the selection where it still fits.
+    fn reload(&mut self) {
+        if let Some(open) = &self.open {
+            let job = Job::Reload { repo: open.repo.clone(), scope: open.selected_scope.clone() };
+            self.send(job);
+        }
+    }
+
+    /// Shows the branch name dialog, if open, and acts on the answer.
+    fn show_branch_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.branch_dialog.as_mut() else {
+            return;
+        };
+        match branches::dialog(ctx, dialog) {
+            Some(DialogAnswer::Submit(op)) => {
+                // The dialog stays open (busy) until git answers: on an error it says why there.
+                dialog.busy = true;
+                dialog.error = None;
+                self.change_branch(op);
+            }
+            Some(DialogAnswer::Cancel) => self.branch_dialog = None,
+            None => {}
+        }
     }
 
     /// Shows the pending question, if any, and acts on the answer.
     fn show_confirmation(&mut self, ctx: &egui::Context) {
         let question = match &self.confirm {
-            Some(Pending::AmendPushed(question) | Pending::Discard { question, .. } | Pending::DiscardLines { question, .. }) => question,
+            Some(
+                Pending::AmendPushed(question)
+                | Pending::Discard { question, .. }
+                | Pending::DiscardLines { question, .. }
+                | Pending::DeleteBranch { question, .. },
+            ) => question,
             None => return,
         };
         match confirm::show(ctx, question) {
@@ -771,6 +930,7 @@ impl GitCraftApp {
                     self.send(job);
                 }
             }
+            Some(Pending::DeleteBranch { name, .. }) => self.change_branch(BranchOp::Delete { name }),
             Some(Pending::DiscardLines { path, patch, .. }) => {
                 if let Some(open) = &self.open {
                     let job = Job::DiscardLines { repo: open.repo.clone(), path, patch };
@@ -1039,6 +1199,30 @@ impl eframe::App for GitCraftApp {
 
 /// The status bar text for a repository that failed to open. Most git errors already name the
 /// folder; repeating it would make a long path appear twice.
+/// The question before deleting a branch: plain when nothing is lost, stronger (naming how many
+/// commits) when some commits are on no other branch, tag or remote branch.
+fn delete_branch_question(name: &str, only_on: usize) -> Confirm {
+    if only_on == 0 {
+        return Confirm {
+            title: "Delete branch?".into(),
+            body: format!("The branch \"{name}\" will be deleted. Its commits are all on other branches, so none of them are lost."),
+            action: "Delete branch".into(),
+        };
+    }
+    let commits = if only_on == 1 { "1 commit".to_string() } else { format!("{only_on} commits") };
+    Confirm {
+        title: "Delete branch with unmerged commits?".into(),
+        body: format!(
+            "\"{name}\" has {commits} that no other branch, tag or remote branch contains. Deleting it leaves {} without a \
+             branch: GitCraft can no longer show {}, and git removes such commits after a while (until then they can be \
+             recovered with git reflog).",
+            if only_on == 1 { "it" } else { "them" },
+            if only_on == 1 { "it" } else { "them" },
+        ),
+        action: format!("Delete branch and {commits}"),
+    }
+}
+
 fn open_failure_message(path: &std::path::Path, error: &gitcraft_git::GitError) -> String {
     let message = error.to_string();
     let shown_path = path.display().to_string();
@@ -1298,6 +1482,122 @@ mod tests {
         assert_eq!(names[1], ("old-repo".to_string(), false, true), "{names:?}");
         let item = app.menu_bar.items().into_iter().find(|item| item.command.id == "file.open_recent.1").cloned().unwrap();
         assert!(!item.enabled, "greyed out in the menu");
+    }
+
+    /// Submits the open branch dialog as its button would, and waits for git.
+    fn submit_branch_dialog(app: &mut GitCraftApp, ctx: &egui::Context) {
+        let dialog = app.branch_dialog.as_mut().expect("the dialog is open");
+        let op = dialog.op().expect("the name can be tried");
+        dialog.busy = true;
+        app.change_branch(op);
+        settle(app, ctx);
+    }
+
+    fn current_branch(app: &GitCraftApp) -> Option<String> {
+        app.open.as_ref()?.refs.head_branch().map(str::to_string)
+    }
+
+    fn local_branches(app: &GitCraftApp) -> Vec<String> {
+        app.open.as_ref().map(|open| open.refs.branches().map(|r| r.short_name().to_string()).collect()).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_new_branch_is_created_and_checked_out_from_the_dialog() {
+        let repo = TestRepo::with_commits(&["Base"]);
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+
+        app.run(Command::NewBranch);
+        let dialog = app.branch_dialog.as_mut().expect("the dialog opens");
+        assert_eq!(dialog.kind, branches::DialogKind::New { start: None, from: "main".into() });
+        dialog.name = "a..b".into();
+        submit_branch_dialog(&mut app, &ctx);
+        let dialog = app.branch_dialog.as_ref().expect("stays open after a refusal");
+        assert!(!dialog.busy && dialog.error.as_deref().is_some_and(|e| e.contains("can't be a branch name")), "{dialog:?}");
+
+        app.branch_dialog.as_mut().unwrap().name = "feature/login".into();
+        submit_branch_dialog(&mut app, &ctx);
+        assert!(app.branch_dialog.is_none(), "closed once created");
+        assert_eq!(local_branches(&app), ["feature/login", "main"]);
+        assert_eq!(current_branch(&app).as_deref(), Some("refs/heads/feature/login"), "checked out");
+        assert_eq!(repo.git(&["branch", "--show-current"]), "feature/login");
+    }
+
+    #[test]
+    fn checking_out_renaming_and_deleting_branches() {
+        let repo = repo_with_feature_branch();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.select_row(0);
+        settle(&mut app, &ctx);
+        let selected = app.open.as_ref().unwrap().selected.clone();
+        assert!(selected.is_some());
+
+        // Check out: the history stays, and so does the selected commit.
+        app.handle_branch_pick(BranchPick::Checkout("feature".into()));
+        settle(&mut app, &ctx);
+        assert_eq!(current_branch(&app).as_deref(), Some("refs/heads/feature"));
+        assert_eq!(app.open.as_ref().unwrap().selected, selected, "no full reopen: the selection stays");
+
+        // Show only "feature", then rename it: the filter follows.
+        app.select_scope(LogScope::Ref("refs/heads/feature".into()));
+        settle(&mut app, &ctx);
+        app.handle_branch_pick(BranchPick::Rename("feature".into()));
+        app.branch_dialog.as_mut().unwrap().name = "feature-2".into();
+        submit_branch_dialog(&mut app, &ctx);
+        assert_eq!(app.open.as_ref().unwrap().selected_scope, LogScope::Ref("refs/heads/feature-2".into()));
+        let root = open_root(&app).unwrap();
+        assert_eq!(app.settings.get().repositories.branch_for(&root), Some("refs/heads/feature-2"));
+        assert_eq!(summaries(&app), ["Feature work", "Base"]);
+
+        // Delete it from main: it has a commit only it reaches, so the warning says so.
+        app.handle_branch_pick(BranchPick::Checkout("main".into()));
+        settle(&mut app, &ctx);
+        app.handle_branch_pick(BranchPick::Delete("feature-2".into()));
+        settle(&mut app, &ctx);
+        match &app.confirm {
+            Some(Pending::DeleteBranch { name, question }) => {
+                assert_eq!(name, "feature-2");
+                assert!(question.body.contains("1 commit") && question.action.contains("1 commit"), "{question:?}");
+            }
+            _ => panic!("deleting must ask first"),
+        }
+        assert_eq!(local_branches(&app).len(), 2, "nothing deleted before the answer");
+        app.run_pending();
+        settle(&mut app, &ctx);
+        assert_eq!(local_branches(&app), ["main"]);
+        assert_eq!(app.open.as_ref().unwrap().selected_scope, LogScope::AllBranches, "the filter lets go of it");
+    }
+
+    #[test]
+    fn delete_questions_say_what_is_lost() {
+        let safe = delete_branch_question("old", 0);
+        assert!(safe.body.contains("none of them are lost") && safe.action == "Delete branch");
+        let risky = delete_branch_question("wip", 3);
+        assert!(risky.body.contains("3 commits") && risky.action == "Delete branch and 3 commits", "{risky:?}");
+    }
+
+    #[test]
+    fn a_refused_checkout_says_why() {
+        let repo = TestRepo::with_commits(&[]);
+        repo.commit_files(&[("f.txt", "main\n")], "Root");
+        repo.git(&["checkout", "-q", "-b", "other"]);
+        repo.commit_files(&[("f.txt", "other\n")], "Other");
+        repo.git(&["checkout", "-q", "main"]);
+        std::fs::write(repo.path().join("f.txt"), "my edit\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.handle_branch_pick(BranchPick::Checkout("other".into()));
+        settle(&mut app, &ctx);
+        match app.status_line() {
+            StatusLine::Error(message) => assert!(message.contains("Could not check out \"other\"") && message.contains("f.txt"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        assert_eq!(current_branch(&app).as_deref(), Some("refs/heads/main"));
+        assert_eq!(std::fs::read_to_string(repo.path().join("f.txt")).unwrap(), "my edit\n");
     }
 
     #[test]

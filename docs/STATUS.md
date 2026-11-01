@@ -170,9 +170,9 @@ exactly like the command line. Submodules as designed (G7).
 | G3a | Pure patch builder for chosen lines; committing partial files with `git apply --cached` | done |
 | G3b | Line and hunk checkboxes in the Commit tab's diff (ticks in memory) | done (`86291a9`) |
 | G3c | Pre-staging: ticks saved in `.git/gitcraft/prestage`, surviving restarts | done (`ac4b603`) |
-| G4 | Discard single hunks, blocks and lines (whole files are done in G2b) | done, not committed |
-| G5 | Branches: new, checkout, rename, delete (with confirmations) | next |
-| G6 | Repository menu: fetch, pull, push on a second worker; cancel; `--force-with-lease` only | |
+| G4 | Discard single hunks, blocks and lines (whole files are done in G2b) | done (`cd2241f`) |
+| G5 | Branches: new, checkout, rename, delete (with confirmations) | done, not committed |
+| G6 | Repository menu: fetch, pull, push on a second worker; cancel; `--force-with-lease` only | next |
 | G7 | Submodules: Repository → Submodules menu, list, open with breadcrumb, Commit tab entries | |
 
 G1 details:
@@ -327,6 +327,28 @@ G4 details:
   nothing, with git's line-ending and filter handling (tested with `core.autocrlf=true`); the index is
   not touched. A patch that no longer fits (the file changed) is refused and nothing changes.
 
+G5 details (decisions 2026-11-01: a separate Current branch dropdown checks out; the old dropdown is
+the history filter, now labelled "Show:"; checking out a single commit (detached HEAD) is left for later):
+- Git layer (`branch.rs`): `check_branch_name` (quick checks, then `git check-ref-format`),
+  `create_branch` (`switch -c` or `branch`, from HEAD, a full ref or a full hash), `switch_branch`
+  (`switch --no-guess`), `rename_branch` (`branch -m`), `commits_only_on` (`rev-list --count` against
+  every other branch, remote branch, tag and HEAD) and `delete_branch` (`branch -D`, after GitCraft's own
+  check and confirmation). New `GitError::InvalidBranchName` explains the rules.
+- Toolbar (now on the Commit tab too): "Current branch:" dropdown with "New branch…" and the local
+  branches (click to check out; right-click: Check out, New branch from here…, Rename…, Delete…),
+  then "Show:" (history filter, Repository tab only), then the repository dropdown.
+- Branch menu: New Branch… (Ctrl+Shift+N), Rename Current Branch….
+- Name dialog (`ui/branches.rs`): spaces and unchanged names are caught as you type; git checks the
+  rest, and a refusal is shown in the dialog, which stays open.
+- Delete asks first; if the branch has commits nothing else contains, the question names how many
+  and the button says so ("Delete branch and 2 commits").
+- A refused checkout (local changes in the way) shows git's message, naming the files; nothing changes.
+- After a branch change or a commit, `Job::Reload` reads the branches and history again without
+  reopening the repository: the selected commit stays. The filter follows a renamed branch and lets go
+  of a deleted one.
+- Not done (proposed, left for later): right-clicking branch labels in the history; a search box in
+  the Current branch dropdown; deleting branches on the remote (needs push, G6).
+
 ## Feature checklist
 
 `docs/features.md` lists every feature as something to try in the app, for a full pass at the end.
@@ -370,8 +392,6 @@ Ideas agreed for later, not scheduled into a step yet.
   Windows if wanted.
 - Set `GITCRAFT_CONFIG_DIR` to use a different settings folder (empty means don't save at all), handy for testing.
 - Fonts: egui's default fonts for now; craft-fonts is not wired in yet.
-- After a commit the whole repository is read again (like reopening it), so the Repository tab's
-  selected commit is cleared. A lighter refresh can come with G5/G6, which also change refs.
 - Committing uses `--pathspec-from-file`, so GitCraft needs git 2.26 or newer (2020).
 - Picking lines of a new (untracked) file stores its bytes as they are on disk: the diff comes from
   `git diff --no-index`, which skips `core.autocrlf` and clean filters. With `autocrlf=true` such a

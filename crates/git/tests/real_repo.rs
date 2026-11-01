@@ -81,6 +81,97 @@ fn same_path(a: &Path, b: &Path) -> bool {
     std::fs::canonicalize(a).unwrap() == std::fs::canonicalize(b).unwrap()
 }
 
+/// The branch HEAD is on, short.
+fn current_branch(repo: &TestRepo) -> String {
+    repo.git(&["branch", "--show-current"])
+}
+
+#[test]
+fn branches_are_created_switched_renamed_and_deleted() {
+    let repo = TestRepo::new();
+    let root = repo.commit("Root");
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+
+    git.create_branch(&opened, "feature/login", None, false).unwrap();
+    assert_eq!(current_branch(&repo), "main", "not checked out");
+    git.create_branch(&opened, "other", Some("refs/heads/main"), true).unwrap();
+    assert_eq!(current_branch(&repo), "other");
+    git.create_branch(&opened, "at-root", Some(&root), false).unwrap();
+
+    git.switch_branch(&opened, "feature/login").unwrap();
+    assert_eq!(current_branch(&repo), "feature/login");
+    git.rename_branch(&opened, "feature/login", "feature/sign-in").unwrap();
+    assert_eq!(current_branch(&repo), "feature/sign-in", "renaming the checked-out branch keeps it checked out");
+
+    assert_eq!(git.commits_only_on(&opened, "other").unwrap(), 0, "its commit is on other branches too");
+    git.delete_branch(&opened, "other").unwrap();
+    let refs = git.refs(&opened).unwrap();
+    let names: Vec<_> = refs.branches().map(|r| r.short_name().to_string()).collect();
+    assert_eq!(names, ["at-root", "feature/sign-in", "main"]);
+    assert!(git.delete_branch(&opened, "feature/sign-in").is_err(), "git refuses to delete the checked-out branch");
+}
+
+#[test]
+fn invalid_branch_names_are_refused_before_anything_runs() {
+    let repo = TestRepo::new();
+    repo.commit("Root");
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    for bad in ["has space", "a..b", "ends.lock", "trail/", "-option", "", "what?", "tilde~1"] {
+        match git.check_branch_name(&opened, bad) {
+            Err(GitError::InvalidBranchName { .. }) => {}
+            other => panic!("{bad:?}: expected InvalidBranchName, got {other:?}"),
+        }
+        assert!(git.create_branch(&opened, bad, None, false).is_err());
+    }
+    assert!(git.check_branch_name(&opened, "feature/ok-1.2").is_ok());
+    assert_eq!(git.refs(&opened).unwrap().branches().count(), 1, "nothing was created");
+}
+
+#[test]
+fn commits_only_on_a_branch_are_counted() {
+    let repo = TestRepo::new();
+    repo.commit("Root");
+    repo.git(&["checkout", "-q", "-b", "work"]);
+    repo.commit("One");
+    repo.commit("Two");
+    repo.git(&["checkout", "-q", "main"]);
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    assert_eq!(git.commits_only_on(&opened, "work").unwrap(), 2);
+    repo.git(&["tag", "keep", "work~1"]);
+    assert_eq!(git.commits_only_on(&opened, "work").unwrap(), 1, "a tag keeps the first one");
+}
+
+#[test]
+fn a_switch_blocked_by_local_changes_changes_nothing() {
+    let repo = TestRepo::new();
+    write(&repo, "f.txt", "main\n");
+    repo.git(&["add", "."]);
+    repo.commit("Root");
+    repo.git(&["checkout", "-q", "-b", "other"]);
+    write(&repo, "f.txt", "other\n");
+    repo.git(&["commit", "-q", "-am", "Other"]);
+    repo.git(&["checkout", "-q", "main"]);
+    write(&repo, "f.txt", "my edit\n");
+
+    let git = git();
+    let opened = git.open_repo(repo.path()).unwrap();
+    match git.switch_branch(&opened, "other") {
+        Err(GitError::CommandFailed { stderr, .. }) => assert!(stderr.contains("f.txt"), "{stderr}"),
+        other => panic!("expected git to refuse, got {other:?}"),
+    }
+    assert_eq!(current_branch(&repo), "main");
+    assert_eq!(std::fs::read_to_string(repo.path().join("f.txt")).unwrap(), "my edit\n");
+
+    // A change that doesn't conflict comes along.
+    write(&repo, "f.txt", "main\n");
+    write(&repo, "new.txt", "carried\n");
+    git.switch_branch(&opened, "other").unwrap();
+    assert_eq!(std::fs::read_to_string(repo.path().join("new.txt")).unwrap(), "carried\n");
+}
+
 #[test]
 fn git_paths_point_into_the_git_folder_even_in_a_worktree() {
     let repo = TestRepo::new();

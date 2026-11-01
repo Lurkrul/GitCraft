@@ -8,6 +8,7 @@ use crate::commands::Command;
 use crate::graph::History;
 use craft_ui::layout::SplitAxis;
 
+use crate::ui::branches::{self, BranchPick};
 use crate::ui::details::{self, DetailsAction, DetailsState};
 use crate::ui::diff_view::{self, DiffState};
 use crate::ui::recent::{self, RecentItem, RepositoryPick};
@@ -74,14 +75,30 @@ pub enum ToolbarPick {
     Scope(LogScope),
     /// A repository in the repository dropdown.
     Repository(RepositoryPick),
+    /// Something in the Current branch dropdown.
+    Branch(BranchPick),
 }
 
-/// The toolbar under the tabs: branch dropdown on the left, then the repository dropdown (its name,
-/// full path on hover; opened, the recent repositories). Returns what was picked this frame.
-pub fn toolbar(ui: &mut egui::Ui, root: &Path, refs: &Refs, selected: &LogScope, recent: &[RecentItem]) -> Option<ToolbarPick> {
+/// The toolbar under the tabs: the Current branch dropdown (check out and manage branches), the
+/// history filter ("Show:"), then the repository dropdown (its name, full path on hover; opened,
+/// the recent repositories). Returns what was picked this frame. `show_filter` is false where the
+/// history isn't shown (the Commit tab).
+pub fn toolbar(ui: &mut egui::Ui, root: &Path, refs: &Refs, selected: &LogScope, recent: &[RecentItem], show_filter: bool) -> Option<ToolbarPick> {
     let mut picked = None;
     ui.horizontal(|ui| {
-        ui.label("Branch:");
+        ui.label("Current branch:");
+        if let Some(pick) = branches::current_branch(ui, refs) {
+            picked = Some(ToolbarPick::Branch(pick));
+        }
+        ui.separator();
+        if !show_filter {
+            ui.label("Repository:");
+            if let Some(pick) = recent::dropdown(ui, root, recent) {
+                picked = Some(ToolbarPick::Repository(pick));
+            }
+            return;
+        }
+        ui.label("Show:").on_hover_text("Which branch's history to show (this doesn't check anything out)");
         // craft-ui's combo box, not egui's (clippy.toml forbids that one; see craft-libs).
         craft_ui::ComboBox::from_id_salt("branch").selected_text(scope_label(selected)).width(220.0).height(DROPDOWN_HEIGHT).show_ui(ui, |ui| {
             for row in branch_rows(refs) {

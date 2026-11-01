@@ -18,6 +18,7 @@ use gitcraft_git::{
 use crate::files;
 use crate::graph::History;
 use crate::prestage::{self, Prestage};
+use crate::ui::branches::BranchOp;
 use crate::ui::commit_tab::CommitPlan;
 
 /// Called by the worker after each event, to make the UI repaint (and so poll) right away.
@@ -32,6 +33,13 @@ pub enum Job {
     Open(PathBuf),
     /// Read the history of an open repository again, in another scope (such as one branch).
     LoadLog { repo: Repo, scope: LogScope },
+    /// Read the branches and the history (in `scope`) again, after they changed (a commit, a
+    /// branch created or checked out…), without reopening the repository.
+    Reload { repo: Repo, scope: LogScope },
+    /// Create, check out, rename or delete a local branch.
+    Branch { repo: Repo, op: BranchOp },
+    /// Count the commits only this branch reaches (lost if it is deleted), for the warning.
+    CountOnlyOn { repo: Repo, name: String },
     /// Read one commit in full (message, people, changed files) for the details panel.
     LoadDetails { repo: Repo, id: String },
     /// Read one changed file's diff for the diff view.
@@ -99,6 +107,21 @@ pub enum Event {
         repo: Repo,
         scope: LogScope,
         error: GitError,
+    },
+    Reloaded {
+        repo: Repo,
+        scope: LogScope,
+        result: Result<(Refs, History), GitError>,
+    },
+    BranchChanged {
+        repo: Repo,
+        op: BranchOp,
+        result: Result<(), GitError>,
+    },
+    OnlyOnCounted {
+        repo: Repo,
+        name: String,
+        result: Result<usize, GitError>,
     },
     DetailsLoaded {
         repo: Repo,
@@ -265,6 +288,27 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, wake: Wake) {
                 Ok(log) => Event::LogLoaded { repo, scope, history: History::new(log) },
                 Err(error) => Event::LogFailed { repo, scope, error },
             },
+            Job::Reload { repo, scope } => {
+                let result = located(&mut git).and_then(|git| {
+                    let refs = git.refs(&repo)?;
+                    let log = git.log(&repo, &scope, DEFAULT_LOG_LIMIT)?;
+                    Ok((refs, History::new(log)))
+                });
+                Event::Reloaded { repo, scope, result }
+            }
+            Job::Branch { repo, op } => {
+                let result = located(&mut git).and_then(|git| match &op {
+                    BranchOp::Create { name, start, checkout } => git.create_branch(&repo, name, start.as_deref(), *checkout),
+                    BranchOp::Switch { name } => git.switch_branch(&repo, name),
+                    BranchOp::Rename { old, new } => git.rename_branch(&repo, old, new),
+                    BranchOp::Delete { name } => git.delete_branch(&repo, name),
+                });
+                Event::BranchChanged { repo, op, result }
+            }
+            Job::CountOnlyOn { repo, name } => {
+                let result = located(&mut git).and_then(|git| git.commits_only_on(&repo, &name));
+                Event::OnlyOnCounted { repo, name, result }
+            }
             Job::LoadDetails { repo, id } => {
                 let result = located(&mut git).and_then(|git| git.commit_details(&repo, &id));
                 Event::DetailsLoaded { repo, id, result }

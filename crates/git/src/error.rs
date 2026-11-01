@@ -37,6 +37,8 @@ pub enum GitError {
     Malformed { what: String, detail: String },
     /// Something GitCraft can't do (yet, or in this case). The text is the whole message.
     Unsupported(String),
+    /// A branch name git doesn't allow.
+    InvalidBranchName { name: String },
 }
 
 impl fmt::Display for GitError {
@@ -68,6 +70,11 @@ impl fmt::Display for GitError {
             Self::OutputTooLarge { command, limit } => write!(f, "{command} produced more than {} MiB of output", limit / (1024 * 1024)),
             Self::Malformed { what, detail } => write!(f, "unexpected output from git ({what}): {detail}"),
             Self::Unsupported(message) => write!(f, "{message}"),
+            Self::InvalidBranchName { name } => write!(
+                f,
+                "\"{name}\" can't be a branch name. Branch names can't be empty, start with \"-\", contain spaces, \"..\" or any of \
+                 ~ ^ : ? * [ \\, or end with \"/\" or \".lock\"."
+            ),
         }
     }
 }

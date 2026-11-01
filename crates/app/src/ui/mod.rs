@@ -2,6 +2,7 @@
 //! the state and decisions stay in `app.rs`.
 
 pub mod about;
+pub mod branches;
 pub mod commit_list;
 pub mod commit_tab;
 pub mod confirm;

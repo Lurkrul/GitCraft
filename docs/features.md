@@ -79,6 +79,25 @@ your own.
 - [ ] A new file shows all green, a deleted file all red.
 - [ ] The divider between details and diff can be dragged, and both dividers survive a restart.
 
+## Branches
+
+- [ ] The toolbar shows "Current branch:" with the checked-out branch, on both the Repository and
+      Commit tabs. The history filter next to it is labelled "Show:" (Repository tab only).
+- [ ] Clicking another branch in the Current branch list checks it out; uncommitted changes that
+      don't conflict come along.
+- [ ] A checkout that would overwrite local changes is refused with git's message naming the files,
+      and nothing changes.
+- [ ] New branch… (in the list, Branch menu, or Ctrl+Shift+N) asks for a name; "Check out the new
+      branch" is ticked by default. Spaces are caught as you type; an invalid name (`a..b`) shows git's
+      rules in the dialog, which stays open.
+- [ ] Right-click a branch → New branch from here… starts the new branch at that branch.
+- [ ] Rename… (right-click, or Branch → Rename Current Branch…) renames; if the history filter shows
+      that branch, it follows the new name (also after a restart).
+- [ ] Delete… asks first. A branch whose commits are all elsewhere says none are lost; one with
+      unmerged commits names how many ("Delete branch and 2 commits"). The checked-out branch can't be
+      deleted.
+- [ ] After a commit or a branch change, the selected commit in the history stays selected.
+
 ## Commit tab: changes
 
 - [ ] The changed files list a checkbox, the path from the repository root, and the change letter on

@@ -16,6 +16,7 @@
 //! # }
 //! ```
 
+mod branch;
 mod command;
 mod commit;
 mod details;

@@ -31,6 +31,7 @@ fn menu_bar(recent: &[RecentItem]) -> MenuBar {
     let mut bar = MenuBar {
         menus: vec![
             Menu::new("File", vec![item(Command::OpenRepository).into(), Node::submenu("Open Recent", recent_items(recent))]).role(MenuRole::File),
+            Menu::new("Branch", vec![item(Command::NewBranch).into(), item(Command::RenameBranch).into()]),
             Menu::new("Help", vec![item(Command::About).into()]).role(MenuRole::Help),
         ],
         documents: Vec::new(),
@@ -125,6 +126,15 @@ mod tests {
         assert!(!items[1].2 && items[1].1.ends_with("(not found)"), "a missing one is greyed out: {:?}", items[1]);
         assert!(items[2].2 && items[2].3 == Some(false));
         assert_eq!(items[3].0, Command::ClearRecent.id());
+    }
+
+    #[test]
+    fn the_branch_menu_has_new_and_rename() {
+        let bar = laid_out(&[]);
+        let new = bar.find(&Command::NewBranch.command_ref()).expect("New Branch item");
+        assert_eq!(new.shortcut, Command::NewBranch.shortcut());
+        assert!(new.shortcut.is_some(), "Ctrl+Shift+N");
+        assert!(bar.find(&Command::RenameBranch.command_ref()).is_some());
     }
 
     #[test]

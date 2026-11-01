@@ -9,18 +9,24 @@ pub enum Command {
     OpenRepository,
     /// Forget the recent repositories (except the open one).
     ClearRecent,
+    /// Create a branch from the current one (asks for its name).
+    NewBranch,
+    /// Rename the checked-out branch (asks for the new name).
+    RenameBranch,
     About,
 }
 
 impl Command {
     /// Every command, for building the menu and checking shortcuts.
-    pub const ALL: [Command; 3] = [Command::OpenRepository, Command::ClearRecent, Command::About];
+    pub const ALL: [Command; 5] = [Command::OpenRepository, Command::ClearRecent, Command::NewBranch, Command::RenameBranch, Command::About];
 
     /// The stable id craft-menu reports when the item is chosen.
     pub fn id(self) -> &'static str {
         match self {
             Command::OpenRepository => "file.open_repository",
             Command::ClearRecent => "file.clear_recent",
+            Command::NewBranch => "branch.new",
+            Command::RenameBranch => "branch.rename",
             Command::About => "help.about",
         }
     }
@@ -29,6 +35,8 @@ impl Command {
         match self {
             Command::OpenRepository => "Open Repository…",
             Command::ClearRecent => "Clear recent list",
+            Command::NewBranch => "New Branch…",
+            Command::RenameBranch => "Rename Current Branch…",
             Command::About => "About GitCraft",
         }
     }
@@ -37,7 +45,8 @@ impl Command {
     pub fn shortcut(self) -> Option<Chord> {
         let text = match self {
             Command::OpenRepository => "Cmd+O",
-            Command::ClearRecent | Command::About => return None,
+            Command::NewBranch => "Cmd+Shift+N",
+            Command::ClearRecent | Command::RenameBranch | Command::About => return None,
         };
         // The text is fixed above, so parsing can't fail in practice; `ok()` keeps it panic-free.
         Chord::parse(text).ok()
