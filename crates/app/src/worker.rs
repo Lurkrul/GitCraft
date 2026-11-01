@@ -38,6 +38,10 @@ pub enum Job {
     /// Read the branches and the history (in `scope`) again, after they changed (a commit, a
     /// branch created or checked out…), without reopening the repository.
     Reload { repo: Repo, scope: LogScope },
+    /// See whether the branches changed outside GitCraft (a commit in a terminal, say): read them,
+    /// and only if they differ from `known` read the history (in `scope`) again too. Cheap when
+    /// nothing changed, so it can run every few seconds.
+    CheckRefs { repo: Repo, scope: LogScope, known: Box<Refs> },
     /// Create, check out, rename or delete a local branch.
     Branch { repo: Repo, op: BranchOp },
     /// Count the commits only this branch reaches (lost if it is deleted), for the warning.
@@ -122,6 +126,12 @@ pub enum Event {
         scope: LogScope,
         result: Result<(Refs, History), GitError>,
     },
+    /// The branches and history if they changed (`None`: nothing changed).
+    RefsChecked {
+        repo: Repo,
+        scope: LogScope,
+        result: Result<Option<(Refs, History)>, GitError>,
+    },
     BranchChanged {
         repo: Repo,
         op: BranchOp,
@@ -201,14 +211,14 @@ pub enum Event {
 impl Job {
     /// Small background chores the user doesn't wait for: they don't make the app look busy.
     fn is_quiet(&self) -> bool {
-        matches!(self, Job::CheckFolders(_) | Job::SavePrestage { .. })
+        matches!(self, Job::CheckFolders(_) | Job::SavePrestage { .. } | Job::CheckRefs { .. })
     }
 }
 
 impl Event {
     /// The events of quiet jobs (see `Job::is_quiet`).
     fn is_quiet(&self) -> bool {
-        matches!(self, Event::FoldersChecked { .. } | Event::PrestageSaved { .. })
+        matches!(self, Event::FoldersChecked { .. } | Event::PrestageSaved { .. } | Event::RefsChecked { .. })
     }
 }
 
@@ -317,6 +327,17 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, wake: Wake) {
                     Ok((refs, History::new(log)))
                 });
                 Event::Reloaded { repo, scope, result }
+            }
+            Job::CheckRefs { repo, scope, known } => {
+                let result = located(&mut git).and_then(|git| {
+                    let refs = git.refs(&repo)?;
+                    if refs == *known {
+                        return Ok(None);
+                    }
+                    let log = git.log(&repo, &scope, DEFAULT_LOG_LIMIT)?;
+                    Ok(Some((refs, History::new(log))))
+                });
+                Event::RefsChecked { repo, scope, result }
             }
             Job::Branch { repo, op } => {
                 let result = located(&mut git).and_then(|git| match &op {

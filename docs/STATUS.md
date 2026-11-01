@@ -380,6 +380,12 @@ Layout rework (requested 2026-11-01, alongside G6, GitHub Desktop style):
   remembered (`history_view`). Opens on Changes the first time. Arrow keys move the history
   selection only in History; showing Changes refreshes the file list.
 
+Outside changes (fixed 2026-11-01, reported by the user: a commit made while GitCraft was open only
+showed after a restart): every 5 seconds while a repository is open, and when the window gets the
+focus back or F5 is pressed, a quiet `CheckRefs` job reads the refs; only if they differ from what is on
+screen does it read the history too, and then the changed files and push/pull counts are read again.
+The selection stays. Background errors are reported once, not every 5 seconds.
+
 ## Feature checklist
 
 `docs/features.md` lists every feature as something to try in the app, for a full pass at the end.

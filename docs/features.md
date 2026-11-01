@@ -110,6 +110,9 @@ your own.
       unmerged commits names how many ("Delete branch and 2 commits"). The checked-out branch can't be
       deleted.
 - [ ] After a commit or a branch change, the selected commit in the history stays selected.
+- [ ] A commit, checkout or fetch made outside GitCraft (a terminal) shows up within about 5 seconds,
+      even while GitCraft stays in front, without a restart; the changed files and the Push/Pull box
+      update too.
 
 ## Fetch, pull and push
 

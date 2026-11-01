@@ -33,6 +33,9 @@ use crate::worker::{Event, Job, Launch, Worker};
 /// The product name, used for the window title and messages.
 pub const APP_NAME: &str = "GitCraft";
 
+/// How often the branches are checked for changes made outside GitCraft.
+const REFS_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 const WORKER_STOPPED: &str = "GitCraft's background worker stopped unexpectedly. Please restart GitCraft.";
 
 /// What a file dialog's answer is for.
@@ -111,6 +114,21 @@ impl OpenRepo {
         self.history.log.commits.iter().position(|commit| commit.id == selected)
     }
 
+    /// Takes in freshly read branches and history. The selected commit stays if it is still in the
+    /// history.
+    fn take_reload(&mut self, refs: Refs, history: History, scope: LogScope) {
+        self.labels = ref_labels::label_map(&refs);
+        self.refs = refs;
+        self.history = history;
+        self.log_scope = scope;
+        if self.selected_row().is_none() {
+            self.selected = None;
+            self.details = DetailsState::Empty;
+            self.selected_file = None;
+            self.diff = DiffState::Empty;
+        }
+    }
+
     /// Whether `name` (a full ref name) is a local or remote branch the dropdown offers.
     fn has_branch(&self, name: &str) -> bool {
         self.refs.branches().chain(self.refs.remote_branches()).any(|r| r.name == name)
@@ -151,6 +169,10 @@ pub struct GitCraftApp {
     net_worker: Option<Worker>,
     /// The network command running, and its cancel flag.
     net: Option<(NetOp, CancelFlag)>,
+    /// When the branches were last checked for changes made outside GitCraft.
+    last_refs_check: Option<Instant>,
+    /// A check is on its way (never more than one at a time).
+    refs_check_running: bool,
 }
 
 /// An action held back until the user confirms it.
@@ -193,6 +215,8 @@ impl GitCraftApp {
             worker,
             net_worker,
             net: None,
+            last_refs_check: None,
+            refs_check_running: false,
             dialogs: Dialogs::new(Arc::new(move || dialog_ctx.request_repaint())),
             open: None,
             error: worker_error.or(net_error).or(startup_problem),
@@ -492,20 +516,30 @@ impl GitCraftApp {
                     return;
                 };
                 match result {
-                    Ok((refs, history)) => {
-                        open.labels = ref_labels::label_map(&refs);
-                        open.refs = refs;
-                        open.history = history;
-                        open.log_scope = scope;
-                        // The selection stays if the commit is still in the history.
-                        if open.selected_row().is_none() {
-                            open.selected = None;
-                            open.details = DetailsState::Empty;
-                            open.selected_file = None;
-                            open.diff = DiffState::Empty;
+                    Ok((refs, history)) => open.take_reload(refs, history, scope),
+                    Err(error) => self.error = Some(format!("Could not read the branches and history again: {error}")),
+                }
+            }
+            Event::RefsChecked { repo, scope, result } => {
+                self.refs_check_running = false;
+                let Some(open) = self.open.as_mut().filter(|open| open.repo == repo && open.selected_scope == scope) else {
+                    return;
+                };
+                match result {
+                    Ok(None) => {}
+                    // Changed outside GitCraft (a commit, checkout or fetch in a terminal): the
+                    // changed files and push/pull counts have likely changed too.
+                    Ok(Some((refs, history))) => {
+                        open.take_reload(refs, history, scope);
+                        self.refresh_status();
+                        self.load_sync();
+                    }
+                    // A background check: reported once, not every few seconds.
+                    Err(error) => {
+                        if self.error.is_none() {
+                            self.error = Some(format!("Could not check the branches for changes: {error}"));
                         }
                     }
-                    Err(error) => self.error = Some(format!("Could not read the branches and history again: {error}")),
                 }
             }
             Event::SyncLoaded { repo, result } => {
@@ -768,8 +802,37 @@ impl GitCraftApp {
         self.handle_refresh_keys(ctx);
         self.handle_dialog_answers();
         self.handle_worker_events();
+        self.check_refs_when_due(ctx);
         self.sync_window_title(ctx);
         self.save_settings_when_due(ctx);
+    }
+
+    /// Checks the branches for changes made outside GitCraft every few seconds, so a commit made in
+    /// a terminal shows up even while GitCraft stays in front.
+    fn check_refs_when_due(&mut self, ctx: &egui::Context) {
+        if self.open.is_none() {
+            return;
+        }
+        let due = self.last_refs_check.is_none_or(|last| last.elapsed() >= REFS_CHECK_INTERVAL);
+        if due {
+            self.check_refs();
+        }
+        // egui only repaints on input; this wakes it for the next check.
+        ctx.request_repaint_after(REFS_CHECK_INTERVAL);
+    }
+
+    /// Asks the worker whether the branches changed (a quiet job; at most one at a time).
+    fn check_refs(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        if self.refs_check_running {
+            return;
+        }
+        let job = Job::CheckRefs { repo: open.repo.clone(), scope: open.selected_scope.clone(), known: Box::new(open.refs.clone()) };
+        self.refs_check_running = true;
+        self.last_refs_check = Some(Instant::now());
+        self.send(job);
     }
 
     /// The title the window should have: "GitCraft — <full path>" while a repository is open.
@@ -1299,6 +1362,7 @@ impl GitCraftApp {
             self.load_sync();
         }
         if focused || f5 {
+            self.check_refs();
             self.refresh_status();
         }
     }
@@ -1945,6 +2009,35 @@ mod tests {
         assert!(safe.body.contains("nothing is lost") && safe.body.contains("--force-with-lease") && safe.action == "Force push");
         let risky = force_push_question("origin/main", 2);
         assert!(risky.body.contains("2 commits") && risky.action == "Force push and replace 2 commits", "{risky:?}");
+    }
+
+    #[test]
+    fn a_commit_made_outside_gitcraft_shows_up_without_a_restart() {
+        let repo = TestRepo::with_commits(&[]);
+        repo.commit_files(&[("f.txt", "one\n")], "First");
+        std::fs::write(repo.path().join("f.txt"), "two\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        open_via_dialog(&mut app, &ctx, repo.path().to_path_buf());
+        app.select_row(0);
+        settle(&mut app, &ctx);
+        let selected = app.open.as_ref().unwrap().selected.clone();
+        assert_eq!(changed_paths(&app), ["f.txt"]);
+
+        // A check with nothing changed leaves everything as it is.
+        app.check_refs();
+        settle(&mut app, &ctx);
+        assert_eq!(summaries(&app), ["First"]);
+
+        // Someone commits in a terminal while GitCraft stays in front; the next periodic check
+        // (forced here instead of waiting 5 seconds) picks it up.
+        repo.git(&["commit", "-q", "-am", "From a terminal"]);
+        app.last_refs_check = None;
+        settle(&mut app, &ctx);
+        assert_eq!(summaries(&app), ["From a terminal", "First"]);
+        assert!(changed_paths(&app).is_empty(), "the committed file left the Changes list");
+        assert_eq!(app.open.as_ref().unwrap().selected, selected, "the selection stays");
+        assert!(matches!(app.status_line(), StatusLine::Info(_)), "no error");
     }
 
     #[test]
